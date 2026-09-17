@@ -1141,7 +1141,12 @@ class TMDBService:
         # 从候选条目中智能选出最优解：
         # 1. 若有候选命中中文标题匹配，优先选命中者；
         #    若首选媒体类型未命中，而另一类型命中，记录纠偏日志！
-        # 2. 若均未命中（或无 hint），选与 preferred_media 一致的，否则选第一条
+        # 2. 若没有任何候选匹配中文标题（或无 hint）：
+        #    - 跨媒体类型（media_type != preferred_media）且未命中标题（matches_hint=False）的条目，
+        #      坚决一票否决！严禁在电视剧 404 时被同 ID 的无关电影捡漏，反之亦然。
+        #    - 候选条目本身拥有明确的中文标题（cn_candidates 非空），但与当前 hint 毫无关联，一票否决！
+        #    - 仅当候选条目与 preferred_media 一致，且 TMDB 上确实暂无中文标题时（如冷门外语原版片），
+        #      才允许作为同类型候选采纳。
         selected = None
         if has_hint:
             matched_candidates = [c for c in candidates if c["matches_hint"]]
@@ -1154,7 +1159,35 @@ class TMDBService:
                     )
 
         if not selected:
-            selected = next((c for c in candidates if c["media_type"] == preferred_media), candidates[0])
+            # 尝试在同类型候选（media_type == preferred_media）中寻找可信条目
+            same_type_candidates = [c for c in candidates if c["media_type"] == preferred_media] if preferred_media else candidates
+            for cand in same_type_candidates:
+                # 若有 hint：
+                # 如果该条目本身在 TMDB 有明确的中文名（cn_candidates 非空），但未能匹配 hint，说明是不同作品，跳过！
+                if has_hint and cand["cn_candidates"]:
+                    continue
+                # 跨媒体检查：若非首选媒体类型且无匹配标题，严禁采纳！
+                if preferred_media and cand["media_type"] != preferred_media:
+                    continue
+                selected = cand
+                break
+
+        if not selected:
+            logger.warning(
+                f"⚠️ TMDB ID {tmdb_id} 原对应条目已失效或与标题不匹配 "
+                f"(preferred={preferred_media}, hint={chinese_title_hint}, candidates={[c['media_type'] for c in candidates]})"
+            )
+            await self._save_alias_cache(
+                tmdb_id=tmdb_id,
+                media_type=preferred_media or "unknown",
+                chinese_title=None,
+                original_title=None,
+                alias=None,
+                source="runtime",
+                status="failed",
+                note="tmdb_id_expired_or_mismatch",
+            )
+            return None
 
         detail = selected["detail"]
         detail_media = selected["media_type"]
@@ -1165,7 +1198,10 @@ class TMDBService:
 
         chinese_title = cn_candidates[0] if cn_candidates else ""
         if not chinese_title:
-            if selected.get("matches_hint") or (len(candidates) == 1 and has_hint):
+            if selected.get("matches_hint"):
+                chinese_title = chinese_title_hint or ""
+            elif preferred_media and selected["media_type"] == preferred_media:
+                # 仅当媒体类型严格一致且属于同类外语作品时才补充记录 hint
                 chinese_title = chinese_title_hint or ""
 
         # 名称策略：
