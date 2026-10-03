@@ -436,6 +436,18 @@ async def _scheduled_session_expiry_check():
             logger.error(f"[SessionCheck] 发送 TG 账号失效通知失败: {e}")
 
 
+async def _check_scheduled_share_status(svc, share_link: str) -> bool:
+    """校验新生成的分享链接，返回其是否仍需等待审核或快照生成。"""
+    status = await svc.get_share_status(share_link)
+    if status is None:
+        raise RuntimeError(f"无法检查新分享链接状态: {share_link}")
+    if status.get("is_expired"):
+        raise RuntimeError(f"新生成的分享链接已过期: {share_link}")
+    if status.get("is_prohibited"):
+        raise RuntimeError(f"新生成的分享链接包含违规内容: {share_link}")
+    return bool(status.get("is_pending"))
+
+
 async def _run_scheduled_share_task(task_id: int):
     """定时移动/复制目录并分享，验证成功后将临时目录移入回收站。"""
     # 1. 查询任务信息
@@ -622,34 +634,49 @@ async def _run_scheduled_share_task(task_id: int):
 
                 logger.info(f"✅ 生成定时分享链接成功: {share_link}")
             
-            # 10. 推送分享链接至 TG 频道
-            if task_db.target_channels:
-                from app.services.tg_bot import tg_service
-                logger.info(f"📢 正在推送至频道: {task_db.target_channels}")
-                
-                # 格式化顶级项结构信息（限 15 项）
-                max_show = 15
-                # 先文件夹后文件，按名称字母顺序升序排序
-                items_sorted = sorted(items, key=lambda x: (not x["is_dir"], x["name"].lower()))
-                shown_items = items_sorted[:max_show]
-                lines = []
-                for item in shown_items:
-                    icon = "📁" if item["is_dir"] else "📄"
-                    lines.append(f"  {icon} {item['name']}")
-                if len(items_sorted) > max_show:
-                    lines.append(f"  ...等共 {len(items_sorted)} 个项目")
-                
-                items_str = "\n".join(lines)
-                full_text = f"📁 定时分享: {folder_name}\n"
-                if items_str:
-                    full_text += f"📂 包含项目:\n{items_str}\n"
-                full_text += f"🔗 链接: {share_link}"
-                
-                metadata = {
-                    "full_text": full_text,
-                    "entities": [],
-                    "photo_id": None
+            share_review_pending = await _check_scheduled_share_status(svc, share_link)
+
+            # 格式化顶级项结构信息（限 15 项）
+            max_show = 15
+            items_sorted = sorted(items, key=lambda x: (not x["is_dir"], x["name"].lower()))
+            shown_items = items_sorted[:max_show]
+            lines = []
+            for item in shown_items:
+                icon = "📁" if item["is_dir"] else "📄"
+                lines.append(f"  {icon} {item['name']}")
+            if len(items_sorted) > max_show:
+                lines.append(f"  ...等共 {len(items_sorted)} 个项目")
+
+            items_str = "\n".join(lines)
+            full_text = f"📁 定时分享: {folder_name}\n"
+            if items_str:
+                full_text += f"📂 包含项目:\n{items_str}\n"
+            full_text += f"🔗 链接: {share_link}"
+
+            metadata = {
+                "full_text": full_text,
+                "entities": [],
+                "photo_id": None
+            }
+
+            from app.services.tg_bot import tg_service
+            if share_review_pending:
+                review_metadata = {
+                    **metadata,
+                    "scheduled_share_review": {
+                        "task_id": task_id,
+                        "account_id": task_db.account_id,
+                        "share_mode": share_mode,
+                        "cleanup_cid": new_cid if share_mode != "direct" else None,
+                        "cleanup_folder_name": new_folder_name if share_mode != "direct" else None,
+                        "cleanup_enabled": bool(getattr(task_db, "cleanup_temp_dir", True)),
+                        "target_channels": task_db.target_channels or [],
+                    },
                 }
+                await tg_service.enqueue_scheduled_share_review(share_link, review_metadata)
+                logger.info(f"🔍 分享链接审核中，已加入持久轮询队列: {share_link}")
+            elif task_db.target_channels:
+                logger.info(f"📢 正在推送至频道: {task_db.target_channels}")
                 await tg_service.broadcast_to_channels(
                     {share_link: share_link},
                     metadata,
@@ -658,7 +685,7 @@ async def _run_scheduled_share_task(task_id: int):
                 
             # 11. 按任务开关清理临时目录，并清空该账号的整个回收站
             cleanup_temp_dir = bool(getattr(task_db, "cleanup_temp_dir", True))
-            if share_mode != "direct":
+            if share_mode != "direct" and not share_review_pending:
                 await _cleanup_scheduled_temp_dir(
                     svc,
                     cid=new_cid,
@@ -667,13 +694,16 @@ async def _run_scheduled_share_task(task_id: int):
                 )
             
             # 12. 更新任务状态为成功
-            async with async_session() as session:
-                task_db_succ = await session.get(ScheduledShareTask, task_id)
-                if task_db_succ:
-                    task_db_succ.status = "success"
-                    task_db_succ.last_run_at = datetime.utcnow()
-                    await session.commit()
-            logger.info(f"🎉 定时分享任务 [{task_id}] '{task_db.name}' 执行完毕！")
+            if not share_review_pending:
+                async with async_session() as session:
+                    task_db_succ = await session.get(ScheduledShareTask, task_id)
+                    if task_db_succ:
+                        task_db_succ.status = "success"
+                        task_db_succ.last_run_at = datetime.utcnow()
+                        await session.commit()
+                logger.info(f"🎉 定时分享任务 [{task_id}] '{task_db.name}' 执行完毕！")
+            else:
+                logger.info(f"⏳ 定时分享任务 [{task_id}] 等待分享链接审核通过后完成")
                     
         except Exception as e:
             logger.error(f"❌ 定时分享任务 [{task_id}] 执行失败: {e}", exc_info=True)

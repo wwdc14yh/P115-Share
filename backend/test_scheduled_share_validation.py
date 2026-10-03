@@ -32,6 +32,51 @@ async def no_sleep(_seconds):
     return None
 
 
+async def test_scheduled_share_status_identifies_pending_review():
+    class Service:
+        async def get_share_status(self, _share_link):
+            return {
+                "is_pending": True,
+                "is_expired": False,
+                "is_prohibited": False,
+            }
+
+    assert await scheduler._check_scheduled_share_status(Service(), "https://115.com/s/test")
+
+
+async def test_scheduled_share_status_rejects_abnormal_links():
+    class Service:
+        def __init__(self, status):
+            self.status = status
+
+        async def get_share_status(self, _share_link):
+            return self.status
+
+    for abnormal_status, expected in [
+        (None, "无法检查"),
+        ({"is_expired": True}, "已过期"),
+        ({"is_prohibited": True}, "违规内容"),
+    ]:
+        try:
+            await scheduler._check_scheduled_share_status(Service(abnormal_status), "https://115.com/s/test")
+        except RuntimeError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"Expected abnormal share status to fail: {abnormal_status}")
+
+
+async def test_scheduled_share_status_accepts_ready_link():
+    class Service:
+        async def get_share_status(self, _share_link):
+            return {
+                "is_pending": False,
+                "is_expired": False,
+                "is_prohibited": False,
+            }
+
+    assert not await scheduler._check_scheduled_share_status(Service(), "https://115.com/s/test")
+
+
 async def test_stable_source_snapshot_resets_after_error():
     expected = snapshot(1, [{"id": "a", "name": "A", "is_dir": True}], 10, 1, 1)
     responses = [expected, RuntimeError("temporary"), expected, expected]
@@ -381,6 +426,9 @@ async def test_move_degrades_gracefully_when_stats_delayed():
 
 
 async def main():
+    await test_scheduled_share_status_identifies_pending_review()
+    await test_scheduled_share_status_rejects_abnormal_links()
+    await test_scheduled_share_status_accepts_ready_link()
     await test_stable_source_snapshot_resets_after_error()
     await test_copy_waits_for_complete_stats_and_duplicate_names()
     await test_move_allows_new_source_items_after_snapshot()

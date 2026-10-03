@@ -11,6 +11,7 @@ from loguru import logger
 import asyncio
 import re
 import time
+from datetime import datetime
 
 def _get_svc():
     """获取当前最优 P115Service（负载均衡调度），降级到全局单例"""
@@ -755,6 +756,21 @@ class TGService:
 
         logger.info(f"⏳ 开始为链接启动轮询任务 (原因: {reason}, 间隔: {interval}s, 最大尝试: {max_attempts}次, 超时: {settings.TG_POLL_TIMEOUT_HOURS}小时): {share_url}")
 
+        scheduled_review = metadata.get("scheduled_share_review")
+        scheduled_svc = None
+        if scheduled_review:
+            from app.services.account_manager import account_manager
+            scheduled_svc = await account_manager.get_service_by_id(
+                scheduled_review["account_id"]
+            )
+            if not scheduled_svc:
+                await self._complete_scheduled_share_review(
+                    None,
+                    pending_info,
+                    error=f"找不到网盘账号 {scheduled_review['account_id']}",
+                )
+                return
+
         for attempt in range(1, max_attempts + 1):
             # 动态计算本次循环的等待时间 (针对审核中链接增加 1min, 2min 前置尝试)
             if reason == "auditing":
@@ -768,7 +784,10 @@ class TGService:
                 current_interval = interval
 
             # 每次轮询重新选择最优账号
-            svc, acct_mgr = _get_svc()
+            if scheduled_review:
+                svc, acct_mgr = scheduled_svc, None
+            else:
+                svc, acct_mgr = _get_svc()
 
             if reason == "restricted":
                 # 分布休眠以便能实时响应全局限制的消除
@@ -796,11 +815,29 @@ class TGService:
 
             if status_info["is_expired"]:
                 logger.warning(f"⏰ 轮询检测到链接已过期: {share_url}")
+                if scheduled_review:
+                    await self._complete_scheduled_share_review(
+                        svc,
+                        pending_info,
+                        error="分享链接在审核期间已过期",
+                    )
+                    return
                 await message.reply(f"⏰ 链接已失效：在审核期间该分享已过期。\n链接: {share_url}")
                 await self._delete_pending_task(pending_info.get("db_id"))
                 return
 
             if not status_info["is_pending"]:  # Not pending anymore (Audit passed and Snapshot ready)
+                if scheduled_review:
+                    if status_info.get("is_prohibited"):
+                        await self._complete_scheduled_share_review(
+                            svc,
+                            pending_info,
+                            error="分享链接包含违规内容",
+                        )
+                    else:
+                        await self._complete_scheduled_share_review(svc, pending_info)
+                    return
+
                 # 如果之前处于受限状态，尝试转存前先清理限制标志（如果还没过时间，但外部可能解除了）
                 if reason == "restricted":
                     svc.clear_restriction()
@@ -929,6 +966,13 @@ class TGService:
                     return
         
         logger.warning(f"⏰ 链接审核轮询超时 ({settings.TG_POLL_TIMEOUT_HOURS}小时): {share_url}")
+        if scheduled_review:
+            await self._complete_scheduled_share_review(
+                scheduled_svc,
+                pending_info,
+                error=f"审核轮询超时（{settings.TG_POLL_TIMEOUT_HOURS}小时）",
+            )
+            return
         await message.reply(f"⏰ 链接审核轮询超时 (已持续 {settings.TG_POLL_TIMEOUT_HOURS} 小时)，请稍后手动检查: {share_url}")
         await self._delete_pending_task(pending_info.get("db_id"))
 
@@ -1420,6 +1464,103 @@ class TGService:
             async with async_session() as session:
                 await session.execute(delete(PendingLink).where(PendingLink.id == db_id))
                 await session.commit()
+
+    async def enqueue_scheduled_share_review(self, share_url: str, metadata: dict):
+        """持久化并轮询 scheduler 创建的分享链接，不对该链接再次转存或生成分享。"""
+        from app.core.database import async_session
+        from app.models.schema import PendingLink
+        from sqlalchemy import select
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(PendingLink).where(PendingLink.share_url == share_url)
+            )
+            existing = result.scalars().first()
+            if existing:
+                existing_review = (existing.metadata_json or {}).get("scheduled_share_review")
+                requested_review = metadata.get("scheduled_share_review")
+                if not existing_review or existing_review.get("task_id") != requested_review.get("task_id"):
+                    raise RuntimeError(f"该分享链接已有其他待处理任务，拒绝覆盖: {share_url}")
+                pending_id = existing.id
+            else:
+                pending = PendingLink(
+                    share_url=share_url,
+                    metadata_json=metadata,
+                    status="auditing",
+                )
+                session.add(pending)
+                await session.commit()
+                pending_id = pending.id
+
+        asyncio.create_task(self._recovered_poll({
+            "share_url": share_url,
+            "metadata": metadata,
+            "db_id": pending_id,
+            "reason": "auditing",
+        }))
+
+    async def _set_scheduled_share_status(self, review_info: dict, status: str):
+        from app.core.database import async_session
+        from app.models.schema import ScheduledShareTask
+
+        async with async_session() as session:
+            task = await session.get(ScheduledShareTask, review_info["task_id"])
+            if task:
+                task.status = status[:50]
+                task.last_run_at = datetime.utcnow()
+                await session.commit()
+            else:
+                logger.warning(
+                    f"定时分享任务 {review_info['task_id']} 已不存在，无法更新审核结果状态"
+                )
+
+    async def _complete_scheduled_share_review(
+        self,
+        svc,
+        pending_info: dict,
+        *,
+        error: str = None,
+    ):
+        metadata = pending_info.get("metadata", {})
+        review_info = metadata["scheduled_share_review"]
+
+        if error is None:
+            try:
+                channels = review_info.get("target_channels") or []
+                if channels:
+                    await self.broadcast_to_channels(
+                        {pending_info["share_url"]: pending_info["share_url"]},
+                        metadata,
+                        channel_ids=channels,
+                    )
+
+                if review_info.get("share_mode") != "direct":
+                    from app.services.scheduler import _cleanup_scheduled_temp_dir
+                    await _cleanup_scheduled_temp_dir(
+                        svc,
+                        cid=review_info["cleanup_cid"],
+                        folder_name=review_info["cleanup_folder_name"],
+                        enabled=review_info.get("cleanup_enabled", True),
+                    )
+            except Exception as exc:
+                error = f"审核通过后的推送或清理失败: {exc}"
+                logger.error(
+                    f"❌ 定时分享链接审核完成后的处理失败: {pending_info['share_url']}: {exc}",
+                    exc_info=True,
+                )
+
+        if error:
+            await self._set_scheduled_share_status(
+                review_info, f"failed: {error}"
+            )
+            await self.send_admin_msg(
+                f"❌ 定时分享链接审核未完成\n链接: {pending_info['share_url']}\n原因: {error}"
+            )
+        else:
+            await self._set_scheduled_share_status(review_info, "success")
+            logger.info(f"✅ 定时分享链接审核通过并完成后续处理: {pending_info['share_url']}")
+
+        await self._delete_pending_task(pending_info.get("db_id"))
 
     async def recover_pending_tasks(self):
         from app.core.database import async_session
