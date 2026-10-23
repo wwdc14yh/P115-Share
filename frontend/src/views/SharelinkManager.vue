@@ -11,8 +11,4 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
-import { message } from 'ant-design-vue';
-
-
 </script>
