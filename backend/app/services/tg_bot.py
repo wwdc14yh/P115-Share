@@ -383,13 +383,12 @@ class TGService:
                         logger.info("📡 嗅探发现链接有效，由于当前处于受限状态，将该链接作为’探路探测’执行...")
                         probing = True
                     else:
-                        await message.reply(f"⏳ 115 账号当前处于接收限制中，系统将在解封后自动处理该链接。")
+                        await message.reply("⏳ 115 账号当前处于接收限制中，系统将在解封后自动处理该链接。")
                         return # 链接无效或确认为持续受限（API不通）
 
-                if not probing:
-                    if q_size > 0 or svc.is_busy:
-                        position = q_size + (1 if svc.is_busy else 0)
-                        await message.reply(f"⏳ 系统繁忙，您的请求已加入队列（当前排在第 {position} 位），请稍候...")
+                if not probing and (q_size > 0 or svc.is_busy):
+                    position = q_size + (1 if svc.is_busy else 0)
+                    await message.reply(f"⏳ 系统繁忙，您的请求已加入队列（当前排在第 {position} 位），请稍候...")
 
                 # 2. Save link with metadata
                 # Determine correct service for saving
@@ -1097,7 +1096,14 @@ class TGService:
             return "", []
         return self._slice_message(text, entities or [], start_u16, end_u16)
 
-    async def _post_to_single_channel_batch(self, channel_config: dict, share_links_map: dict, metadata: dict):
+    async def _post_to_single_channel_batch(
+        self,
+        channel_config: dict,
+        share_links_map: dict,
+        metadata: dict,
+        *,
+        raise_on_error: bool = False,
+    ):
         """Post to a single channel with multiple link replacements"""
         channel_id = channel_config.get("id")
         is_concise = channel_config.get("concise", False)
@@ -1232,6 +1238,8 @@ class TGService:
             logger.info(f"已将推送发送至频道: {channel_id}")
         except Exception as e:
             logger.error(f"Failed to post to channel {channel_id}: {e}")
+            if raise_on_error:
+                raise
 
     def _update_access_codes(self, text: str, entities: list, share_links_map: dict) -> tuple[str, list]:
         """Update access codes in text to match new links for multiple pairs"""
@@ -1410,7 +1418,15 @@ class TGService:
             logger.error(f"Failed to get chat info for {chat_id}: {e}")
             return None
 
-    async def broadcast_to_channels(self, share_links_map: dict, metadata: dict, channel_ids: list = None):
+    async def broadcast_to_channels(
+        self,
+        share_links_map: dict,
+        metadata: dict,
+        channel_ids: list = None,
+        *,
+        raise_on_error: bool = False,
+        validate_only: bool = False,
+    ):
         """Broadcast processed link(s) to all configured and enabled channels
         :param channel_ids: Optional list of channel IDs to filter the broadcast. If None, send to all enabled.
         """
@@ -1438,8 +1454,15 @@ class TGService:
         
         if not enabled_channels:
             logger.debug(f"没有符合条件的目标频道 (channel_ids={channel_ids})，跳过广播")
+            if raise_on_error:
+                raise RuntimeError(f"没有可用的推送频道 (channel_ids={channel_ids})")
             return
-            
+
+        if validate_only:
+            if not self.bot:
+                raise RuntimeError("Telegram Bot 尚未初始化，无法推送葵花宝典分享链接")
+            return
+
         for chan in enabled_channels:
             is_concise = chan.get("concise", False)
             if is_concise:
@@ -1447,10 +1470,20 @@ class TGService:
                 for original_url, share_link in share_links_map.items():
                     temp_meta = metadata.copy()
                     temp_meta["share_url"] = original_url
-                    await self._post_to_single_channel(chan, share_link, temp_meta)
+                    await self._post_to_single_channel_batch(
+                        chan,
+                        {share_link: share_link},
+                        temp_meta,
+                        raise_on_error=raise_on_error,
+                    )
             else:
                 # Normal mode: Single broadcast with all links replaced
-                await self._post_to_single_channel_batch(chan, share_links_map, metadata)
+                await self._post_to_single_channel_batch(
+                    chan,
+                    share_links_map,
+                    metadata,
+                    raise_on_error=raise_on_error,
+                )
 
     async def _post_to_single_channel(self, channel_config: dict, share_link: str, metadata: dict):
         """Legacy helper for single link post (still used by poll_pending or concise)"""
@@ -1500,6 +1533,14 @@ class TGService:
         }))
 
     async def _set_scheduled_share_status(self, review_info: dict, status: str):
+        if review_info.get("sunflower_mode"):
+            logger.info(
+                "🌻 葵花宝典分享审核结果不覆盖任务执行状态：task_id=%s, review_status=%s",
+                review_info.get("task_id"),
+                status,
+            )
+            return
+
         from app.core.database import async_session
         from app.models.schema import ScheduledShareTask
 
@@ -1532,6 +1573,7 @@ class TGService:
                         {pending_info["share_url"]: pending_info["share_url"]},
                         metadata,
                         channel_ids=channels,
+                        raise_on_error=bool(review_info.get("sunflower_mode")),
                     )
 
                 if review_info.get("share_mode") != "direct":

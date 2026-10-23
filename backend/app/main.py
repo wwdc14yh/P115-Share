@@ -5,21 +5,21 @@ import sys
 from collections import deque
 from contextlib import asynccontextmanager
 
+from app.api.accounts import router as accounts_router
+from app.api.auth import router as auth_router
+from app.api.config import router as config_router
+from app.api.excel import router as excel_router
+from app.api.scheduled_share import router as scheduled_share_router
+from app.api.scheduled_transfer import router as scheduled_transfer_router
+from app.api.sensitive import router as sensitive_router
+from app.api.share import router as share_router
+from app.api.share_link_handler import router as sharelink_router
+from app.core.config import settings
+from app.version import VERSION
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
-
-from app.core.config import settings
-from app.api.config import router as config_router
-from app.api.auth import router as auth_router
-from app.api.excel import router as excel_router
-from app.api.share import router as share_router
-from app.api.accounts import router as accounts_router
-from app.api.sensitive import router as sensitive_router
-from app.api.scheduled_share import router as scheduled_share_router
-from app.services.tg_bot import tg_service
-from app.version import VERSION
 
 # 启动时清除进程级代理环境变量，防止 docker-compose 注入的 HTTP_PROXY 等
 # 被 httpcore/aiohttp 自动读取，导致 P115Client 意外走代理
@@ -56,7 +56,7 @@ class LogBroadcast:
         for msg in self.history:
             try:
                 await websocket.send_text(msg)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         self.active_connections.append(websocket)
         if not self.loop:
@@ -78,7 +78,7 @@ class LogBroadcast:
     async def _send_safe(self, websocket: WebSocket, message: str):
         try:
             await websocket.send_text(message)
-        except Exception:
+        except Exception:  # noqa: BLE001
             self.disconnect(websocket)
 
 log_broadcast = LogBroadcast()
@@ -150,6 +150,7 @@ app = FastAPI(
 )
 
 from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -166,6 +167,8 @@ app.include_router(share_router, prefix="/api")
 app.include_router(accounts_router, prefix="/api")
 app.include_router(sensitive_router, prefix="/api")
 app.include_router(scheduled_share_router, prefix="/api")
+app.include_router(scheduled_transfer_router, prefix="/api")  # Note: scheduled_transfer_router is mounted under /api/scheduled-transfer
+app.include_router(sharelink_router, prefix="/api/sharelinkhandler")  # Note: sharelink_router is mounted under /api/sharelinkhandler
 
 # Mount static files separately (highest priority for /static)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -173,7 +176,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/{full_path:path}")
 async def serve_frontend(full_path: str):
     # API and WebSocket routes should be handled by their routers
-    if full_path.startswith("api/") or full_path.startswith("ws/"):
+    if full_path.startswith(("api/", "ws/")):
         return {"detail": "Not Found"}
     
     # Path to static folder
@@ -181,8 +184,7 @@ async def serve_frontend(full_path: str):
     
     # Try to find the actual file (strip 'static/' prefix if present in catch-all)
     lookup_path = full_path
-    if lookup_path.startswith("static/"):
-        lookup_path = lookup_path[7:]
+    lookup_path = lookup_path.removeprefix("static/")
         
     file_path = os.path.join(static_dir, lookup_path)
     if os.path.isfile(file_path):

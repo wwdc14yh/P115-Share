@@ -1,7 +1,18 @@
 from datetime import datetime
-from sqlalchemy import String, Text, DateTime, Integer, Boolean, JSON, Float, ForeignKey, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+
 from app.core.database import Base
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
 
 class User(Base):
     __tablename__ = "users"
@@ -249,3 +260,23 @@ class ScheduledShareTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+
+class ScheduledTransferTask(Base):
+    """定时目录转存任务表"""
+    __tablename__ = "scheduled_transfer_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    source_account_id: Mapped[int] = mapped_column(Integer, index=True)
+    target_account_id: Mapped[int] = mapped_column(Integer, index=True)
+    source_dir_path: Mapped[str] = mapped_column(String(255))                         # 源115网盘目录路径，例如 /电影
+    target_dir_path: Mapped[str] = mapped_column(String(255))                         # 目标115网盘目录路径，例如 /电影
+    cron_expression: Mapped[str] = mapped_column(String(50))                          # cron定时表达式，如 0 3 * * *
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)                      # 任务是否启用
+    status: Mapped[str] = mapped_column(String(50), default="waiting")                # 当前运行状态 (waiting, running, success, failed)
+    remove_source_after_transfer: Mapped[bool] = mapped_column(Boolean, default=False)  # 转存后是否删除源文件
+    share_file_after_transfer: Mapped[bool] = mapped_column(Boolean, default=False)             # 转存后是否分享文件
+    remove_file_after_share: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_run_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)            # 最近一次执行时间
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

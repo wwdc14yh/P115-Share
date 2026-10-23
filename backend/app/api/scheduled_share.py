@@ -2,13 +2,14 @@
 定时分享任务管理 API
 """
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, field_validator
-from typing import Optional, List, Union
-from sqlalchemy import select
+from typing import List, Optional, Union
+
 from app.api.auth import get_current_user
 from app.core.database import async_session
 from app.models.schema import ScheduledShareTask
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, field_validator
+from sqlalchemy import select
 
 router = APIRouter(prefix="/scheduled-share", tags=["scheduled-share"])
 
@@ -28,6 +29,13 @@ class ScheduledShareTaskCreate(BaseModel):
     sensitive_replace_enabled: bool = False
     sensitive_replace_pinyin: Union[str, bool, int] = "0"
     sensitive_replace_tmdb: bool = False
+
+    @field_validator("share_mode")
+    @classmethod
+    def validate_share_mode(cls, value):
+        if value not in {"move", "copy", "direct", "sunflower"}:
+            raise ValueError("share_mode 必须是 move、copy、direct 或 sunflower")
+        return value
 
     @field_validator('min_size', mode='before')
     @classmethod
@@ -52,6 +60,13 @@ class ScheduledShareTaskUpdate(BaseModel):
     sensitive_replace_enabled: Optional[bool] = None
     sensitive_replace_pinyin: Optional[Union[str, bool, int]] = None
     sensitive_replace_tmdb: Optional[bool] = None
+
+    @field_validator("share_mode")
+    @classmethod
+    def validate_share_mode(cls, value):
+        if value is not None and value not in {"move", "copy", "direct", "sunflower"}:
+            raise ValueError("share_mode 必须是 move、copy、direct 或 sunflower")
+        return value
 
     @field_validator('min_size', mode='before')
     @classmethod
@@ -108,11 +123,13 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
     # Reconcile share_mode and clear_files:
     share_mode = data.share_mode
     clear_files = data.clear_files
+    if share_mode == "sunflower" and not data.target_channels:
+        return {"state": False, "message": "葵花宝典模式必须选择至少一个推送频道"}
     if share_mode == "move" and not clear_files:
         share_mode = "copy"
     elif share_mode == "direct":
         clear_files = False
-    elif share_mode == "copy":
+    elif share_mode in {"copy", "sunflower"}:
         clear_files = False
     elif share_mode == "move":
         clear_files = True
@@ -165,6 +182,12 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
         update_dict = data.model_dump(exclude_unset=True)
         if "sensitive_replace_pinyin" in update_dict and update_dict["sensitive_replace_pinyin"] is not None:
             update_dict["sensitive_replace_pinyin"] = str(update_dict["sensitive_replace_pinyin"])
+        resulting_share_mode = update_dict.get(
+            "share_mode", task.share_mode or ("move" if task.clear_files else "copy")
+        )
+        resulting_channels = update_dict.get("target_channels", task.target_channels)
+        if resulting_share_mode == "sunflower" and not resulting_channels:
+            return {"state": False, "message": "葵花宝典模式必须选择至少一个推送频道"}
         # Reconcile share_mode and clear_files if either is updated
         if "share_mode" in update_dict or "clear_files" in update_dict:
             curr_share_mode = update_dict.get("share_mode", task.share_mode or ("move" if task.clear_files else "copy"))
@@ -174,7 +197,7 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
                 curr_share_mode = "copy"
             elif curr_share_mode == "direct":
                 curr_clear_files = False
-            elif curr_share_mode == "copy":
+            elif curr_share_mode in {"copy", "sunflower"}:
                 curr_clear_files = False
             elif curr_share_mode == "move":
                 curr_clear_files = True

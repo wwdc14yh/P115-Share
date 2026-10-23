@@ -42,8 +42,8 @@
           </a-tag>
         </template>
         <template v-if="column.key === 'cleanup_temp_dir'">
-          <a-tag :color="record.share_mode === 'direct' ? 'default' : (record.cleanup_temp_dir ? 'red' : 'default')">
-            {{ record.share_mode === 'direct' ? '不适用' : (record.cleanup_temp_dir ? '清理并清空回收站' : '保留') }}
+          <a-tag :color="record.share_mode === 'direct' || record.share_mode === 'sunflower' ? 'default' : (record.cleanup_temp_dir ? 'red' : 'default')">
+            {{ record.share_mode === 'direct' || record.share_mode === 'sunflower' ? '不适用' : (record.cleanup_temp_dir ? '清理并清空回收站' : '保留') }}
           </a-tag>
         </template>
         <template v-if="column.key === 'min_size'">
@@ -135,12 +135,14 @@
               <span v-if="formState.share_mode === 'move'">移动模式：原目录文件会被直接剪切移动到临时目录，原目录自动清空，速度极快且不占额外空间（适合增量分享/追更）。</span>
               <span v-else-if="formState.share_mode === 'copy'">复制模式：原目录文件会被复制一份进行分享，原目录文件保持不动，但下次会重复分享（适合全量分享/归档）。</span>
               <span v-else-if="formState.share_mode === 'direct'">直接分享模式：直接对原目录（源目录本身）进行分享，不创建临时文件夹，不移动或复制任何文件，原目录文件保持不动。</span>
+              <span v-else-if="formState.share_mode === 'sunflower'">葵花宝典模式：为路径下每个含文件的直接子目录单独创建分享；仅识别到 TMDB ID 的目录会规范化为拼音标题，并给递归文件名添加目录标题前缀。分享创建后直接推送频道，不检查审核状态；每次网盘操作等待 5–10 秒，每个目录处理完成后等待 3–7 分钟再处理下一个。推送成功后副本和原子目录会移入回收站；不会清空整个回收站。</span>
             </div>
           </template>
           <a-select v-model:value="formState.share_mode">
             <a-select-option value="move">移动模式 (剪切)</a-select-option>
             <a-select-option value="copy">复制模式 (保留)</a-select-option>
             <a-select-option value="direct">直接分享模式 (只分享不操作文件)</a-select-option>
+            <a-select-option value="sunflower">葵花宝典模式 (子目录脱敏分享)</a-select-option>
           </a-select>
         </a-form-item>
 
@@ -194,11 +196,11 @@
           <a-switch v-model:checked="formState.enabled" />
         </a-form-item>
 
-        <a-form-item label="启用敏感词替换" name="sensitive_replace_enabled">
+        <a-form-item label="启用敏感词替换" name="sensitive_replace_enabled" v-if="formState.share_mode !== 'sunflower'">
           <a-switch v-model:checked="formState.sensitive_replace_enabled" />
         </a-form-item>
 
-        <a-form-item label="中文名称替换为拼音全拼" name="sensitive_replace_pinyin" v-if="formState.sensitive_replace_enabled">
+        <a-form-item label="中文名称替换为拼音全拼" name="sensitive_replace_pinyin" v-if="formState.share_mode !== 'sunflower' && formState.sensitive_replace_enabled">
           <a-select v-model:value="formState.sensitive_replace_pinyin" style="width: 280px">
             <a-select-option value="0">禁用 (不转换拼音)</a-select-option>
             <a-select-option value="1">直接替换为拼音全拼 (无条件)</a-select-option>
@@ -206,7 +208,7 @@
           </a-select>
         </a-form-item>
 
-        <a-form-item label="启用 TMDB 别名替换" name="sensitive_replace_tmdb" v-if="formState.sensitive_replace_enabled">
+        <a-form-item label="启用 TMDB 别名替换" name="sensitive_replace_tmdb" v-if="formState.share_mode !== 'sunflower' && formState.sensitive_replace_enabled">
           <a-tooltip :title="!isTmdbConfigured ? '请先在系统配置中填写 TMDB API Key' : ''">
             <span style="display: inline-block">
               <a-switch
@@ -223,6 +225,9 @@
       
       <div v-if="(formState.share_mode === 'move' || formState.share_mode === 'copy') && formState.cleanup_temp_dir" style="margin-top: 12px">
         <a-alert message="安全警示" description="此任务会在分享成功后删除临时目录，并清空该 115 账号的整个回收站。请确保回收站中没有需要保留的文件。" type="warning" show-icon />
+      </div>
+      <div v-if="formState.share_mode === 'sunflower'" style="margin-top: 12px">
+        <a-alert message="葵花宝典模式会删除原始子目录" description="每个分享链接创建并成功推送到频道后，副本和对应原始子目录都会被移入 115 回收站。请确认这些原始文件可以删除；本模式不会清空回收站。" type="warning" show-icon />
       </div>
     </a-modal>
   </div>
@@ -323,6 +328,7 @@ const getShareModeColor = (mode: string) => {
   if (mode === 'move') return 'orange';
   if (mode === 'copy') return 'blue';
   if (mode === 'direct') return 'green';
+  if (mode === 'sunflower') return 'purple';
   return 'default';
 };
 
@@ -330,6 +336,7 @@ const getShareModeText = (mode: string) => {
   if (mode === 'move') return '移动';
   if (mode === 'copy') return '复制';
   if (mode === 'direct') return '直接';
+  if (mode === 'sunflower') return '葵花宝典';
   return mode;
 };
 

@@ -36,6 +36,14 @@
           <template #icon><ClockCircleOutlined /></template>
           <span>定时分享管理</span>
         </a-menu-item>
+        <a-menu-item key="transfer" @click="currentView = 'transfer'">
+          <template #icon><CloudSyncOutlined /></template>
+          <span>跨账号转存任务管理</span>
+        </a-menu-item>
+        <a-menu-item key="sharelink" @click="currentView = 'sharelink'">
+          <template #icon><ShareAltOutlined /></template>
+          <span>分享链接处理</span>
+        </a-menu-item>
         <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
           <template #icon><WarningOutlined /></template>
           <span>敏感词管理</span>
@@ -84,6 +92,10 @@
         <a-menu-item key="scheduled" @click="currentView = 'scheduled'">
           <template #icon><ClockCircleOutlined /></template>
           <span>定时分享管理</span>
+        </a-menu-item>
+        <a-menu-item key="transfer" @click="currentView = 'transfer'">
+          <template #icon><CloudSyncOutlined /></template>
+          <span>跨账号转存任务管理</span>
         </a-menu-item>
         <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
           <template #icon><WarningOutlined /></template>
@@ -161,6 +173,8 @@
           <AccountManager v-if="currentView === 'accounts'" />
           <Sensitive v-if="currentView === 'sensitive'" />
           <ScheduledShareManager v-if="currentView === 'scheduled'" />
+          <TransferManager v-if="currentView === 'transfer'" />
+          <SharelinkManager v-if="currentView === 'sharelink'" />
           <Settings v-if="currentView === 'settings'" />
         </div>
       </a-layout-content>
@@ -215,7 +229,8 @@ import {
   ShareAltOutlined,
   CloudServerOutlined,
   ClockCircleOutlined,
-  WarningOutlined
+  WarningOutlined,
+  CloudSyncOutlined
 } from '@ant-design/icons-vue';
 import { Grid, message, theme } from 'ant-design-vue';
 import Dashboard from './Dashboard.vue';
@@ -226,6 +241,8 @@ import Settings from './Settings.vue';
 import AccountManager from './AccountManager.vue';
 import Sensitive from './Sensitive.vue';
 import ScheduledShareManager from './ScheduledShareManager.vue';
+import TransferManager from './TransferManager.vue';
+import SharelinkManager from './SharelinkManager.vue';
 import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import { useRouter } from 'vue-router';
