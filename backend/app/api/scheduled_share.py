@@ -2,16 +2,16 @@
 定时分享任务管理 API
 """
 import asyncio
-from typing import List, Optional, Union
 
 from app.api.auth import get_current_user
 from app.core.database import async_session
 from app.models.schema import ScheduledShareTask
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 router = APIRouter(prefix="/scheduled-share", tags=["scheduled-share"])
+_current_user_dependency = Depends(get_current_user)
 
 
 class ScheduledShareTaskCreate(BaseModel):
@@ -24,10 +24,10 @@ class ScheduledShareTaskCreate(BaseModel):
     cleanup_temp_dir: bool = True
     min_size: float = 0.0
     min_size_unit: str = "GB"
-    target_channels: List[str] = []
+    target_channels: list[str] = []
     enabled: bool = True
     sensitive_replace_enabled: bool = False
-    sensitive_replace_pinyin: Union[str, bool, int] = "0"
+    sensitive_replace_pinyin: str | bool | int = "0"
     sensitive_replace_tmdb: bool = False
 
     @field_validator("share_mode")
@@ -46,20 +46,20 @@ class ScheduledShareTaskCreate(BaseModel):
 
 
 class ScheduledShareTaskUpdate(BaseModel):
-    name: Optional[str] = None
-    account_id: Optional[int] = None
-    dir_path: Optional[str] = None
-    cron_expression: Optional[str] = None
-    clear_files: Optional[bool] = None
-    share_mode: Optional[str] = None
-    cleanup_temp_dir: Optional[bool] = None
-    min_size: Optional[float] = None
-    min_size_unit: Optional[str] = None
-    target_channels: Optional[List[str]] = None
-    enabled: Optional[bool] = None
-    sensitive_replace_enabled: Optional[bool] = None
-    sensitive_replace_pinyin: Optional[Union[str, bool, int]] = None
-    sensitive_replace_tmdb: Optional[bool] = None
+    name: str | None = None
+    account_id: int | None = None
+    dir_path: str | None = None
+    cron_expression: str | None = None
+    clear_files: bool | None = None
+    share_mode: str | None = None
+    cleanup_temp_dir: bool | None = None
+    min_size: float | None = None
+    min_size_unit: str | None = None
+    target_channels: list[str] | None = None
+    enabled: bool | None = None
+    sensitive_replace_enabled: bool | None = None
+    sensitive_replace_pinyin: str | bool | int | None = None
+    sensitive_replace_tmdb: bool | None = None
 
     @field_validator("share_mode")
     @classmethod
@@ -77,7 +77,7 @@ class ScheduledShareTaskUpdate(BaseModel):
 
 
 @router.get("/")
-async def list_tasks(user=Depends(get_current_user)):
+async def list_tasks(user=_current_user_dependency):
     """获取所有定时分享任务列表"""
     async with async_session() as session:
         result = await session.execute(select(ScheduledShareTask).order_by(ScheduledShareTask.id.desc()))
@@ -111,13 +111,13 @@ async def list_tasks(user=Depends(get_current_user)):
 
 
 @router.post("/")
-async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_user)):
+async def create_task(data: ScheduledShareTaskCreate, user=_current_user_dependency):
     """创建定时分享任务"""
     # 校验 cron 表达式
     from apscheduler.triggers.cron import CronTrigger
     try:
         CronTrigger.from_crontab(data.cron_expression)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"state": False, "message": f"Cron 表达式格式错误: {e}"}
 
     # Reconcile share_mode and clear_files:
@@ -129,9 +129,7 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
         return {"state": False, "message": "逐条分享模式必须选择至少一个推送频道"}
     if share_mode == "move" and not clear_files:
         share_mode = "copy"
-    elif share_mode == "direct":
-        clear_files = False
-    elif share_mode in {"copy", "sunflower", "per_file"}:
+    elif share_mode == "direct" or share_mode in {"copy", "sunflower", "per_file"}:
         clear_files = False
     elif share_mode == "move":
         clear_files = True
@@ -166,13 +164,13 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
 
 
 @router.put("/{task_id}")
-async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends(get_current_user)):
+async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=_current_user_dependency):
     """更新定时分享任务"""
     if data.cron_expression is not None:
         from apscheduler.triggers.cron import CronTrigger
         try:
             CronTrigger.from_crontab(data.cron_expression)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             return {"state": False, "message": f"Cron 表达式格式错误: {e}"}
 
     async with async_session() as session:
@@ -199,9 +197,7 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
             
             if curr_share_mode == "move" and not curr_clear_files:
                 curr_share_mode = "copy"
-            elif curr_share_mode == "direct":
-                curr_clear_files = False
-            elif curr_share_mode in {"copy", "sunflower", "per_file"}:
+            elif curr_share_mode == "direct" or curr_share_mode in {"copy", "sunflower", "per_file"}:
                 curr_clear_files = False
             elif curr_share_mode == "move":
                 curr_clear_files = True
@@ -226,7 +222,7 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
 
 
 @router.delete("/{task_id}")
-async def delete_task(task_id: int, user=Depends(get_current_user)):
+async def delete_task(task_id: int, user=_current_user_dependency):
     """删除定时分享任务"""
     async with async_session() as session:
         task = await session.get(ScheduledShareTask, task_id)
@@ -245,7 +241,7 @@ async def delete_task(task_id: int, user=Depends(get_current_user)):
 
 
 @router.post("/{task_id}/toggle")
-async def toggle_task(task_id: int, user=Depends(get_current_user)):
+async def toggle_task(task_id: int, user=_current_user_dependency):
     """启用/禁用定时任务"""
     async with async_session() as session:
         task = await session.get(ScheduledShareTask, task_id)
@@ -270,7 +266,7 @@ async def toggle_task(task_id: int, user=Depends(get_current_user)):
 
 
 @router.post("/{task_id}/trigger")
-async def trigger_task(task_id: int, user=Depends(get_current_user)):
+async def trigger_task(task_id: int, user=_current_user_dependency):
     """手动触发定时分享任务（后台异步执行）"""
     async with async_session() as session:
         task = await session.get(ScheduledShareTask, task_id)
@@ -280,8 +276,31 @@ async def trigger_task(task_id: int, user=Depends(get_current_user)):
         if not task.enabled:
             return {"state": False, "message": "任务未启用，无法触发"}
 
+        if task.status == "running":
+            return {"state": False, "message": "任务正在运行中，请等待当前任务执行完成后再触发"}
+
+        # Claim the task before returning so concurrent requests cannot queue duplicate runs.
+        result = await session.execute(
+            update(ScheduledShareTask)
+            .where(
+                ScheduledShareTask.id == task_id,
+                ScheduledShareTask.enabled.is_(True),
+                ScheduledShareTask.status != "running",
+            )
+            .values(status="running")
+        )
+        if result.rowcount != 1:
+            await session.refresh(task)
+            if task.status == "running":
+                return {"state": False, "message": "任务正在运行中，请等待当前任务执行完成后再触发"}
+            if not task.enabled:
+                return {"state": False, "message": "任务未启用，无法触发"}
+            return {"state": False, "message": "任务状态已变更，请稍后重试"}
+
+        await session.commit()
+
         # 异步启动任务
         from app.services.scheduler import _run_scheduled_share_task
-        asyncio.create_task(_run_scheduled_share_task(task_id))
+        asyncio.create_task(_run_scheduled_share_task(task_id, already_claimed=True))
 
         return {"state": True, "message": "任务已手动触发，后台异步执行中"}

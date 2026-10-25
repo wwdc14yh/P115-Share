@@ -14,7 +14,7 @@ from app.services.p115 import p115_service
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from p115client import check_response
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 logger = logging.getLogger(__name__)
 
@@ -1219,7 +1219,7 @@ async def _check_scheduled_share_status(svc, share_link: str) -> bool:
     return bool(status.get("is_pending"))
 
 
-async def _run_scheduled_share_task(task_id: int):
+async def _run_scheduled_share_task(task_id: int, *, already_claimed: bool = False):
     """定时移动/复制目录并分享，验证成功后将临时目录移入回收站。"""
     # 1. 查询任务信息
     async with async_session() as session:
@@ -1227,12 +1227,41 @@ async def _run_scheduled_share_task(task_id: int):
         task = result.scalar_one_or_none()
         if not task or not task.enabled:
             return
+        if not already_claimed:
+            if task.status == "running":
+                logger.info("⏭️ 定时分享任务 [%s] 正在运行，跳过本次调度", task_id)
+                return
+
+            claim_result = await session.execute(
+                update(ScheduledShareTask)
+                .where(
+                    ScheduledShareTask.id == task_id,
+                    ScheduledShareTask.enabled.is_(True),
+                    ScheduledShareTask.status != "running",
+                )
+                .values(status="running")
+            )
+            if claim_result.rowcount != 1:
+                logger.info("⏭️ 定时分享任务 [%s] 状态已变更或正在运行，跳过本次调度", task_id)
+                return
+            await session.commit()
         
     # 2. 获取网盘账号 service
-    from app.services.account_manager import account_manager
-    svc = await account_manager.get_service_by_id(task.account_id)
-    if not svc:
-        raise ValueError(f"网盘账号 (ID: {task.account_id}) 不存在")
+    try:
+        from app.services.account_manager import account_manager
+
+        svc = await account_manager.get_service_by_id(task.account_id)
+        if not svc:
+            raise ValueError(f"网盘账号 (ID: {task.account_id}) 不存在")
+    except Exception as exc:
+        logger.error("❌ 获取定时分享任务 [%s] 的网盘账号服务失败: %s", task_id, exc, exc_info=True)
+        async with async_session() as session:
+            task_db_err = await session.get(ScheduledShareTask, task_id)
+            if task_db_err:
+                task_db_err.status = f"failed: {str(exc)[:100]}"
+                task_db_err.last_run_at = datetime.utcnow()
+                await session.commit()
+        raise
 
     async def _execute_flow():
         # 再次获取任务对象以更新其状态为运行中

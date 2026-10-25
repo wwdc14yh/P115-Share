@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.api import scheduled_share as scheduled_share_api
 from app.services import scheduler
 from app.services.p115 import P115Service
 
@@ -75,6 +76,88 @@ async def test_scheduled_share_status_accepts_ready_link():
             }
 
     assert not await scheduler._check_scheduled_share_status(Service(), "https://115.com/s/test")
+
+
+async def test_trigger_task_rejects_repeated_calls_until_completion():
+    task = SimpleNamespace(id=1, enabled=True, status="waiting")
+    scheduled_coroutines = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _model, _task_id):
+            return task
+
+        async def execute(self, _statement):
+            if task.status == "running" or not task.enabled:
+                return SimpleNamespace(rowcount=0)
+            task.status = "running"
+            return SimpleNamespace(rowcount=1)
+
+        async def refresh(self, _task):
+            return None
+
+        async def commit(self):
+            return None
+
+    async def fake_run(_task_id, *, already_claimed=False):
+        assert already_claimed
+        return None
+
+    def capture_task(coroutine):
+        scheduled_coroutines.append(coroutine)
+
+    with (
+        patch.object(scheduled_share_api, "async_session", FakeSession),
+        patch("app.services.scheduler._run_scheduled_share_task", fake_run),
+        patch.object(scheduled_share_api.asyncio, "create_task", capture_task),
+    ):
+        try:
+            first_response = await scheduled_share_api.trigger_task(1)
+            repeated_response = await scheduled_share_api.trigger_task(1)
+
+            assert first_response["state"] is True
+            assert repeated_response["state"] is False
+            assert "正在运行中" in repeated_response["message"]
+            assert len(scheduled_coroutines) == 1
+
+            task.status = "success"
+            completed_response = await scheduled_share_api.trigger_task(1)
+            assert completed_response["state"] is True
+            assert len(scheduled_coroutines) == 2
+        finally:
+            for coroutine in scheduled_coroutines:
+                coroutine.close()
+
+
+async def test_scheduled_run_skips_when_task_is_already_running():
+    task = SimpleNamespace(enabled=True, status="running", account_id=1)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: task)
+
+    async def unexpected_service_lookup(_account_id):
+        raise AssertionError("A running scheduled task must be skipped before service lookup")
+
+    with (
+        patch.object(scheduler, "async_session", FakeSession),
+        patch(
+            "app.services.account_manager.account_manager.get_service_by_id",
+            unexpected_service_lookup,
+        ),
+    ):
+        await scheduler._run_scheduled_share_task(1)
 
 
 async def test_stable_source_snapshot_resets_after_error():
@@ -429,6 +512,8 @@ async def main():
     await test_scheduled_share_status_identifies_pending_review()
     await test_scheduled_share_status_rejects_abnormal_links()
     await test_scheduled_share_status_accepts_ready_link()
+    await test_trigger_task_rejects_repeated_calls_until_completion()
+    await test_scheduled_run_skips_when_task_is_already_running()
     await test_stable_source_snapshot_resets_after_error()
     await test_copy_waits_for_complete_stats_and_duplicate_names()
     await test_move_allows_new_source_items_after_snapshot()
