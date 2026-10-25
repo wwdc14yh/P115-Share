@@ -6,14 +6,15 @@ import re
 import time
 from collections import Counter
 from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from p115client import check_response
-from sqlalchemy import select
+
 from app.core.config import settings
 from app.core.database import async_session
 from app.models.schema import ScheduledShareTask
 from app.services.p115 import p115_service
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from p115client import check_response
+from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def parse_size_to_bytes(val) -> int:
     if not match:
         try:
             return int(float(s_val))
-        except:
+        except:  # noqa: E722
             return 0
     number, unit = match.groups()
     number = float(number)
@@ -140,7 +141,7 @@ async def _capture_stable_dir_snapshot(
                 return current
             previous = current
             last_error = None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             previous = None
             last_error = exc
             logger.warning("定时分享目录快照读取失败（第 %s/%s 次）: %s", attempt, attempts, exc)
@@ -329,7 +330,7 @@ async def _wait_transfer_complete(
                 )
         except MoveProgressFailed:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             stable_times = 0
             structure_stable_times = 0
             logger.warning("定时分享传输完成检测失败，将继续轮询: %s", exc)
@@ -1573,7 +1574,7 @@ class CleanupScheduler:
                     replace_existing=True
                 )
                 logger.info(f"[OK] 已设置清理保存目录定时任务: {settings.P115_CLEANUP_DIR_CRON}")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"[ERROR] 设置清理保存目录定时任务失败: {e}")
         else:
             if self.scheduler.get_job(job_id):
