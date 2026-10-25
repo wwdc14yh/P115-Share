@@ -23,6 +23,9 @@ TRANSFER_STABLE_SAMPLES = 3
 TRANSFER_NO_PROGRESS_TIMEOUT = 15 * 60
 TRANSFER_ABSOLUTE_TIMEOUT = 2 * 60 * 60
 SCHEDULED_SHARE_CLEANUP_DELAY = 60
+PER_FILE_COPY_STABLE_SAMPLES = 3
+PER_FILE_COPY_NO_PROGRESS_TIMEOUT = 15 * 60
+PER_FILE_COPY_ABSOLUTE_TIMEOUT = 2 * 60 * 60
 
 
 class MoveProgressFailed(RuntimeError):
@@ -443,6 +446,402 @@ async def _sunflower_pause(operation: str, minimum: float = 5, maximum: float = 
     await asyncio.sleep(delay)
 
 
+async def _per_file_pause(operation: str, minimum: float = 5, maximum: float = 10) -> None:
+    delay = random.uniform(minimum, maximum)
+    logger.info("⏱️ 逐条分享模式：%s 前等待 %.1f 秒", operation, delay)
+    await asyncio.sleep(delay)
+
+
+async def _broadcast_per_file_until_delivered(
+    tg_service,
+    share_link: str,
+    metadata: dict,
+    target_channels: list,
+    source_name: str,
+) -> None:
+    """逐频道推送；失败的频道每 2–4 分钟重试，成功的频道不重复发送。"""
+    for channel_id in dict.fromkeys(str(channel) for channel in target_channels):
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                logger.info(
+                    "📢 推送逐条分享：原文件名=%s，链接=%s，频道=%s，尝试=%s",
+                    source_name,
+                    share_link,
+                    channel_id,
+                    attempt,
+                )
+                await tg_service.broadcast_to_channels(
+                    {share_link: share_link},
+                    metadata,
+                    channel_ids=[channel_id],
+                    raise_on_error=True,
+                )
+                logger.info(
+                    "✅ 逐条分享已推送至频道：原文件名=%s，频道=%s，尝试=%s",
+                    source_name,
+                    channel_id,
+                    attempt,
+                )
+                break
+            except Exception as exc:
+                delay = random.uniform(120, 240)
+                logger.error(
+                    "❌ 逐条分享推送失败：文件=%s，频道=%s，尝试=%s，错误=%s；%.1f 秒后重试",
+                    source_name,
+                    channel_id,
+                    attempt,
+                    exc,
+                    delay,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
+
+
+async def _collect_per_file_candidates(
+    svc,
+    cid: int,
+    initial_items: list,
+    root_name: str,
+) -> list[dict]:
+    """递归收集文件，并为每个文件关联最近的 TMDB 媒体目录。"""
+    files = []
+    root_context = None
+    if _extract_sunflower_tmdb_id(root_name):
+        standardized_name, _, source_title = _sunflower_name_parts(root_name)
+        root_context = (root_name, source_title, standardized_name)
+
+    async def walk(current_cid: int, items: list, media_context: tuple | None) -> None:
+        for item in items:
+            if not item["is_dir"]:
+                files.append({
+                    **item,
+                    "parent_cid": current_cid,
+                    "media_context": media_context,
+                })
+                continue
+
+            child_name = item["name"]
+            child_context = media_context
+            if _extract_sunflower_tmdb_id(child_name):
+                standardized_name, _, source_title = _sunflower_name_parts(child_name)
+                child_context = (child_name, source_title, standardized_name)
+
+            child_cid = int(item["id"])
+            await _per_file_pause(f"读取文件目录 {child_name} (CID: {child_cid})")
+            child_items = await svc._get_dir_items(child_cid, strict=True)
+            if not child_items:
+                logger.info("📂 发现空目录：%s (CID: %s)，将在任务结束时清理", child_name, child_cid)
+            await walk(child_cid, child_items, child_context)
+
+    await walk(cid, initial_items, root_context)
+    return files
+
+
+async def _wait_for_single_file_copy(svc, cid: int, file_name: str) -> dict:
+    """等待新建的临时目录中出现并稳定一个完整文件副本。"""
+    started_at = time.monotonic()
+    last_progress_at = started_at
+    previous_signature = None
+    stable_samples = 0
+
+    while True:
+        now = time.monotonic()
+        if now - started_at >= PER_FILE_COPY_ABSOLUTE_TIMEOUT:
+            raise TimeoutError(f"等待文件副本完成超过 {PER_FILE_COPY_ABSOLUTE_TIMEOUT} 秒: {file_name}")
+        if now - last_progress_at >= PER_FILE_COPY_NO_PROGRESS_TIMEOUT:
+            raise TimeoutError(f"等待文件副本连续 {PER_FILE_COPY_NO_PROGRESS_TIMEOUT} 秒无进展: {file_name}")
+
+        await _per_file_pause(f"检查文件副本 {file_name}")
+        snapshot = await _read_dir_snapshot(svc, cid)
+        items = snapshot["items"]
+        if len(items) > 1 or any(item["is_dir"] for item in items):
+            raise RuntimeError(f"临时副本目录中出现非预期项目: CID={cid}, items={items}")
+        if len(items) == 1 and snapshot["stats"]["file_count"] == 1:
+            signature = (
+                items[0]["id"],
+                items[0]["name"],
+                snapshot["stats"]["size"],
+                snapshot["stats"]["file_count"],
+            )
+            if signature != previous_signature:
+                previous_signature = signature
+                last_progress_at = time.monotonic()
+                stable_samples = 1
+            else:
+                stable_samples += 1
+            if stable_samples >= PER_FILE_COPY_STABLE_SAMPLES:
+                logger.info(
+                    "✅ 文件副本已稳定：%s (新 CID: %s)，连续确认 %s 次",
+                    items[0]["name"],
+                    items[0]["id"],
+                    stable_samples,
+                )
+                return items[0]
+        elif items:
+            stable_samples = 0
+            previous_signature = None
+        logger.info(
+            "⏳ 等待文件副本就绪：源名称=%s，临时目录 CID=%s，当前文件数=%s",
+            file_name,
+            cid,
+            snapshot["stats"]["file_count"],
+        )
+
+
+async def _remove_empty_per_file_dirs(svc, initial_items: list) -> int:
+    """递归清理源目录中的空子目录，但始终保留任务配置的源目录本身。"""
+    removed = 0
+
+    async def prune(items: list) -> None:
+        nonlocal removed
+        for item in items:
+            if not item["is_dir"]:
+                continue
+            child_cid = int(item["id"])
+            await _per_file_pause(f"复查目录 {item['name']} 是否为空")
+            child_items = await svc._get_dir_items(child_cid, strict=True)
+            await prune(child_items)
+
+            await _per_file_pause(f"确认目录 {item['name']} 的最终内容")
+            remaining_items = await svc._get_dir_items(child_cid, strict=True)
+            if remaining_items:
+                continue
+
+            await _per_file_pause(f"删除空目录 {item['name']} (CID: {child_cid})")
+            delete_resp = await svc._api_call_with_timeout(
+                svc.client.fs_delete_app,
+                [child_cid],
+                async_=True,
+                **svc._get_ios_ua_kwargs(),
+            )
+            check_response(delete_resp)
+            removed += 1
+            logger.info("🗑️ 已移除空目录：%s (CID: %s)", item["name"], child_cid)
+
+    await prune(initial_items)
+    return removed
+
+
+async def _run_per_file_share_mode(
+    svc,
+    task_db,
+    task_id: int,
+    src_cid: int,
+    items: list,
+    root_name: str,
+) -> None:
+    """逐个复制单文件、脱敏、创建分享、推送并删除源文件。"""
+    from app.services.tg_bot import tg_service
+
+    target_channels = task_db.target_channels or []
+    if not target_channels:
+        raise ValueError("逐条分享模式必须配置至少一个推送频道")
+    await _per_file_pause("校验推送频道")
+    await tg_service.broadcast_to_channels(
+        {},
+        {},
+        channel_ids=target_channels,
+        raise_on_error=True,
+        validate_only=True,
+    )
+
+    candidates = await _collect_per_file_candidates(svc, src_cid, items, root_name)
+    logger.info(
+        "📄 逐条分享模式启动：源目录 CID=%s，递归文件数=%s，目标频道=%s",
+        src_cid,
+        len(candidates),
+        target_channels,
+    )
+    if not candidates:
+        logger.info("📂 源目录中没有文件，将仅清理空子目录")
+
+    failures = []
+    completed = 0
+    for index, source_file in enumerate(candidates, start=1):
+        source_id = str(source_file["id"])
+        source_name = source_file["name"]
+        parent_cid = int(source_file["parent_cid"])
+        media_context = source_file["media_context"]
+        sanitized_name = source_name
+        if media_context:
+            source_dir_name, source_title, standardized_dir_name = media_context
+            sanitized_name = _sunflower_file_name(
+                source_name,
+                source_dir_name=source_dir_name,
+                source_title=source_title or "",
+                standardized_dir_name=standardized_dir_name,
+            )
+
+        stage_cid = None
+        share_link = None
+        share_created = False
+        files_deleted = False
+        delivery_registered = False
+        logger.info(
+            "📄 开始处理第 %s/%s 个文件：%s (FID: %s, 父目录 CID: %s)，脱敏=%s",
+            index,
+            len(candidates),
+            source_name,
+            source_id,
+            parent_cid,
+            sanitized_name != source_name,
+        )
+
+        try:
+            unique_suffix = f"{task_id}_{time.time_ns() % 1_000_000:06d}"
+            staging_name = f".scheduled_share_{unique_suffix}"
+            await _per_file_pause(f"为文件 {source_name} 创建临时副本目录")
+            create_resp = await svc._api_call_with_timeout(
+                svc.client.fs_makedirs_app,
+                staging_name,
+                pid=parent_cid,
+                async_=True,
+                **svc._get_ios_ua_kwargs(),
+            )
+            check_response(create_resp)
+            create_data = create_resp.get("data")
+            if not isinstance(create_data, dict):
+                create_data = {}
+            stage_cid = int(
+                create_data.get("cid")
+                or create_data.get("id")
+                or create_resp.get("cid")
+                or create_resp.get("id")
+                or 0
+            )
+            if not stage_cid:
+                raise RuntimeError(f"创建文件临时副本目录后未返回 CID: {create_resp}")
+            logger.info("📁 文件临时副本目录已创建：%s (CID: %s)", staging_name, stage_cid)
+
+            await _per_file_pause(f"复制文件 {source_name} (FID: {source_id})")
+            copy_resp = await svc._api_call_with_timeout(
+                svc.client.fs_copy_app,
+                [source_id],
+                pid=stage_cid,
+                async_=True,
+                **svc._get_ios_ua_kwargs(),
+            )
+            check_response(copy_resp)
+            copied_file = await _wait_for_single_file_copy(svc, stage_cid, source_name)
+            copied_id = str(copied_file["id"])
+
+            if sanitized_name != copied_file["name"]:
+                await _per_file_pause(f"脱敏副本文件名 {copied_file['name']} -> {sanitized_name}")
+                rename_resp = await svc._api_call_with_timeout(
+                    svc.client.fs_rename_app,
+                    (copied_id, sanitized_name),
+                    async_=True,
+                    **svc._get_ios_ua_kwargs(),
+                )
+                check_response(rename_resp)
+                logger.info("✏️ 副本文件脱敏完成：%s -> %s", copied_file["name"], sanitized_name)
+            else:
+                logger.info("ℹ️ 未发现 TMDB 标识或文件名无需调整，副本保持原名：%s", source_name)
+
+            await _per_file_pause(f"为文件副本 {sanitized_name} 创建分享链接")
+            share_link = await svc._share_fids_direct([copied_id])
+            if not share_link:
+                raise RuntimeError(f"为文件副本 {sanitized_name} 创建分享链接失败")
+            share_created = True
+            logger.info(
+                "🔗 单文件分享链接创建成功：原文件=%s，分享文件=%s，链接=%s",
+                source_name,
+                sanitized_name,
+                share_link,
+            )
+
+            logger.info(
+                "🗑️ 分享链接已创建，立即删除副本和原文件：原 FID=%s，副本目录 CID=%s",
+                source_id,
+                stage_cid,
+            )
+            delete_resp = await svc._api_call_with_timeout(
+                svc.client.fs_delete_app,
+                [stage_cid, source_id],
+                async_=True,
+                **svc._get_ios_ua_kwargs(),
+            )
+            check_response(delete_resp)
+            files_deleted = True
+            logger.info(
+                "✅ 副本和原文件已移入回收站：原 FID=%s，副本目录 CID=%s",
+                source_id,
+                stage_cid,
+            )
+
+            metadata = {
+                "full_text": f"📄 定时逐条分享：{source_name}\n🔗 链接：{share_link}",
+                "entities": [],
+                "photo_id": None,
+                "scheduled_share_per_file": True,
+            }
+            await _broadcast_per_file_until_delivered(
+                tg_service,
+                share_link,
+                metadata,
+                target_channels,
+                source_name,
+            )
+            delivery_registered = True
+            logger.info("📢 原文件名及分享链接已成功推送到所有目标频道：%s", source_name)
+            completed += 1
+            if index < len(candidates):
+                await _per_file_pause(
+                    f"当前文件已推送并清理，等待后处理下一个文件：{source_name}",
+                    minimum=180,
+                    maximum=420,
+                )
+        except Exception as exc:
+            logger.error(
+                "❌ 逐条分享文件处理失败：%s (FID: %s)，分享创建=%s，推送成功=%s，链接=%s，错误=%s",
+                source_name,
+                source_id,
+                share_created,
+                delivery_registered,
+                share_link or "无",
+                exc,
+                exc_info=True,
+            )
+            if share_created and not delivery_registered:
+                logger.error(
+                    "⚠️ 分享链接尚未推送至所有目标频道：链接=%s，副本及原文件已清理=%s",
+                    share_link,
+                    files_deleted,
+                )
+            if stage_cid and not share_created:
+                try:
+                    await _per_file_pause(f"清理未分享成功的临时副本 CID={stage_cid}")
+                    cleanup_resp = await svc._api_call_with_timeout(
+                        svc.client.fs_delete_app,
+                        [stage_cid],
+                        async_=True,
+                        **svc._get_ios_ua_kwargs(),
+                    )
+                    check_response(cleanup_resp)
+                    logger.info("🗑️ 未生成分享链接的临时副本已清理：CID=%s", stage_cid)
+                except Exception as cleanup_exc:
+                    logger.error(
+                        "❌ 清理未分享成功的临时副本失败：CID=%s，错误=%s",
+                        stage_cid,
+                        cleanup_exc,
+                        exc_info=True,
+                    )
+            failures.append(f"{source_name}: {exc}")
+
+    removed_dirs = await _remove_empty_per_file_dirs(svc, items)
+    logger.info(
+        "📊 逐条分享处理结束：成功推送并清理=%s/%s，失败=%s，移除空目录=%s",
+        completed,
+        len(candidates),
+        len(failures),
+        removed_dirs,
+    )
+    if failures:
+        raise RuntimeError(f"逐条分享模式有 {len(failures)} 个文件处理失败：{'；'.join(failures)}")
+
+
 async def _scan_sunflower_tree(svc, cid: int, initial_items: list | None = None) -> list[dict]:
     """递归读取目录树，返回所有文件的 ID、名称和父目录 ID。"""
     files = []
@@ -646,7 +1045,7 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
             if not share_link:
                 raise RuntimeError(f"为副本目录 {standardized_name} 创建分享链接失败")
             share_created = True
-            logger.info("🔗 分享链接创建成功：目录=%s，链接=%s", standardized_name, share_link)
+            logger.info("🔗 分享链接创建成功：目录=%s，链接=%s", source_name, share_link)
 
             full_text = f"🌻 葵花宝典定时分享：{standardized_name}\n🔗 链接：{share_link}"
             metadata = {"full_text": full_text, "entities": [], "photo_id": None}
@@ -861,11 +1260,14 @@ async def _run_scheduled_share_task(task_id: int):
             
             # 4. 只解析已有目录，避免配置错误时自动创建空源目录
             share_mode = task_db.share_mode if (hasattr(task_db, "share_mode") and task_db.share_mode) else ("move" if task_db.clear_files else "copy")
-            if share_mode == "sunflower":
-                await _sunflower_pause(f"验证源目录的父目录 {parent_path}")
+            serial_pause = (
+                _per_file_pause if share_mode == "per_file" else _sunflower_pause
+            )
+            if share_mode in {"sunflower", "per_file"}:
+                await serial_pause(f"验证源目录的父目录 {parent_path}")
             parent_cid = await _get_existing_dir_cid(svc, parent_path)
-            if share_mode == "sunflower":
-                await _sunflower_pause(f"验证源目录 {src_path}")
+            if share_mode in {"sunflower", "per_file"}:
+                await serial_pause(f"验证源目录 {src_path}")
             src_cid = await _get_existing_dir_cid(svc, src_path)
 
             # 5. 移动/复制模式必须先建立连续稳定的源目录基准
@@ -874,8 +1276,8 @@ async def _run_scheduled_share_task(task_id: int):
                 baseline = await _capture_stable_dir_snapshot(svc, src_cid)
                 items = baseline["items"]
             else:
-                if share_mode == "sunflower":
-                    await _sunflower_pause(f"读取待处理源目录 {src_path}")
+                if share_mode in {"sunflower", "per_file"}:
+                    await serial_pause(f"读取待处理源目录 {src_path}")
                 items = await svc._get_dir_items(src_cid, strict=True)
             top_ids = {item["id"] for item in items}
             if not top_ids:
@@ -900,8 +1302,8 @@ async def _run_scheduled_share_task(task_id: int):
                     if baseline:
                         dir_size = baseline["stats"]["size"]
                     else:
-                        if share_mode == "sunflower":
-                            await _sunflower_pause(f"检查源目录容量 {src_path}")
+                        if share_mode in {"sunflower", "per_file"}:
+                            await serial_pause(f"检查源目录容量 {src_path}")
                         cat_resp = await svc._api_call_with_timeout(
                             svc.client.fs_category_get_app, src_cid, async_=True,
                             **svc._get_ios_ua_kwargs()
@@ -943,6 +1345,28 @@ async def _run_scheduled_share_task(task_id: int):
                         await session.commit()
                 logger.info(
                     "🎉 葵花宝典定时分享任务 [%s] '%s' 执行完毕！",
+                    task_id,
+                    task_db.name,
+                )
+                return
+
+            if share_mode == "per_file":
+                await _run_per_file_share_mode(
+                    svc,
+                    task_db,
+                    task_id,
+                    src_cid,
+                    items,
+                    folder_name,
+                )
+                async with async_session() as session:
+                    task_db_succ = await session.get(ScheduledShareTask, task_id)
+                    if task_db_succ:
+                        task_db_succ.status = "success"
+                        task_db_succ.last_run_at = datetime.utcnow()
+                        await session.commit()
+                logger.info(
+                    "🎉 逐条分享定时任务 [%s] '%s' 执行完毕！",
                     task_id,
                     task_db.name,
                 )

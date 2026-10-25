@@ -1136,6 +1136,18 @@ class TGService:
                 entities.append(e)
 
         try:
+            if metadata.get("scheduled_share_per_file") and full_text:
+                await self.bot.send_message(
+                    channel_id,
+                    text=full_text,
+                    disable_web_page_preview=False,
+                )
+                logger.info(
+                    "已将逐条分享文件名及链接发送至频道: {}",
+                    channel_id,
+                )
+                return
+
             if is_concise:
                 for original_url, share_link in share_links_map.items():
                     if isinstance(share_link, list) and len(share_link) > 1:

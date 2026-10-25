@@ -22,6 +22,14 @@
         <template v-if="column.key === 'enabled'">
           <a-switch v-model:checked="record.enabled" @change="toggleTransferTaskEnabled(record.id)" />
         </template>
+        <template v-else-if="column.key === 'status'">
+          <a-tag :color="getStatusColor(record.status)">
+            {{ getStatusText(record.status) }}
+          </a-tag>
+        </template>
+        <template v-else-if="column.key === 'last_run_at'">
+          <span style="font-size: 12px; color: #666">{{ formatDate(record.last_run_at) }}</span>
+        </template>
         <template v-else-if="column.key === 'actions'">
           <a-space>
             <a-button type="link" @click="editTransferTask(record)">编辑</a-button>
@@ -103,6 +111,7 @@ import { ref, reactive, onMounted } from 'vue';
 import axios from 'axios';
 import { message } from 'ant-design-vue';
 import { PlusOutlined } from '@ant-design/icons-vue';
+import dayjs from 'dayjs';
 
 interface Account {
   id: number;
@@ -122,6 +131,8 @@ interface TransferTask {
   on_remove_file_after_transfer: boolean;
   on_share_file_after_transfer: boolean;
   on_remove_file_after_share: boolean;
+  status: string;
+  last_run_at: string | null;
 }
 
 interface TransferTaskApiResponse {
@@ -136,6 +147,8 @@ interface TransferTaskApiResponse {
   remove_source_after_transfer: boolean;
   share_file_after_transfer: boolean;
   remove_file_after_share: boolean;
+  status: string;
+  last_run_at: string | null;
 }
 
 interface TransferTaskForm {
@@ -174,6 +187,8 @@ const fromApiTask = (task: TransferTaskApiResponse): TransferTask => ({
   on_remove_file_after_transfer: task.remove_source_after_transfer,
   on_share_file_after_transfer: task.share_file_after_transfer,
   on_remove_file_after_share: task.remove_file_after_share,
+  status: task.status,
+  last_run_at: task.last_run_at,
 });
 
 // State for modal visibility and form data
@@ -218,13 +233,39 @@ const columns = [
   { title: '源文件夹', key: 'source_folder', dataIndex: 'source_folder' },
   { title: '目标文件夹', key: 'target_folder', dataIndex: 'target_folder' },
   { title: '定时计划', key: 'schedule_cron', dataIndex: 'schedule_cron' },
+  { title: '运行状态', key: 'status', dataIndex: 'status' },
   { title: '启用状态', key: 'enabled', dataIndex: 'enabled' },
+  { title: '上次运行时间', key: 'last_run_at', dataIndex: 'last_run_at' },
   { title: '操作', key: 'actions' },
 ];
 const formRef = ref();
 const accounts = ref<Account[]>([]);
 const tableLoading = ref(false);
 const modalSubmitting = ref(false);
+
+const getStatusColor = (status: string) => {
+  if (!status) return 'orange';
+  if (status === 'success') return 'green';
+  if (status.startsWith('failed')) return 'red';
+  if (status === 'running') return 'blue';
+  if (status === 'disabled') return 'default';
+  return 'orange';
+};
+
+const getStatusText = (status: string) => {
+  if (!status) return '等待中';
+  if (status === 'success') return '成功';
+  if (status.startsWith('failed')) return '失败';
+  if (status === 'running') return '执行中';
+  if (status === 'disabled') return '已禁用';
+  return '等待中';
+};
+
+const formatDate = (dateStr: string | null) => {
+  if (!dateStr) return '暂未运行';
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(dateStr) ? dateStr : `${dateStr}Z`;
+  return dayjs(normalized).format('YYYY-MM-DD HH:mm:ss');
+};
 
 // Function to open the modal for creating a new transfer task
 
@@ -310,7 +351,7 @@ const updateTransferTask = async (taskId: number) => {
 };
 const deleteTransferTask = async (taskId: number) => {
   try {
-    const res = await axios.delete(`/api/scheduled-transfer/${taskId}/`);
+    const res = await axios.delete(`/api/scheduled-transfer/${taskId}`);
     console.log('Transfer task deleted:', res.data);
     await fetchTransferTasks();
   } catch (e) {
@@ -322,8 +363,10 @@ const triggerTransferTask = async (taskId: number) => {
   try {
     const res = await axios.post(`/api/scheduled-transfer/${taskId}/run`);
     console.log('Transfer task triggered:', res.data);
-    // Optionally, refresh the list of transfer tasks here
     await fetchTransferTasks();
+    setTimeout(fetchTransferTasks, 3000);
+    setTimeout(fetchTransferTasks, 10000);
+    setTimeout(fetchTransferTasks, 20000);
   } catch (e) {
     console.error(e);
     message.error('触发转存任务失败，请检查网络连接或稍后重试');

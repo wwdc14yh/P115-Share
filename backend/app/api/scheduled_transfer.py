@@ -74,6 +74,7 @@ async def update_scheduled_transfer_task(task_id: int, data: ScheduledTransferTa
         return {"state": True, "task": task}
     
 @router.delete("/{task_id}")
+@router.delete("/{task_id}/delete")
 async def delete_scheduled_transfer_task(task_id: int, current_user=CURRENT_USER_DEPENDENCY):
     async with async_session() as session:
         task = await session.get(ScheduledTransferTask, task_id)

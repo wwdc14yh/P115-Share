@@ -33,8 +33,8 @@ class ScheduledShareTaskCreate(BaseModel):
     @field_validator("share_mode")
     @classmethod
     def validate_share_mode(cls, value):
-        if value not in {"move", "copy", "direct", "sunflower"}:
-            raise ValueError("share_mode 必须是 move、copy、direct 或 sunflower")
+        if value not in {"move", "copy", "direct", "sunflower", "per_file"}:
+            raise ValueError("share_mode 必须是 move、copy、direct、sunflower 或 per_file")
         return value
 
     @field_validator('min_size', mode='before')
@@ -64,8 +64,8 @@ class ScheduledShareTaskUpdate(BaseModel):
     @field_validator("share_mode")
     @classmethod
     def validate_share_mode(cls, value):
-        if value is not None and value not in {"move", "copy", "direct", "sunflower"}:
-            raise ValueError("share_mode 必须是 move、copy、direct 或 sunflower")
+        if value is not None and value not in {"move", "copy", "direct", "sunflower", "per_file"}:
+            raise ValueError("share_mode 必须是 move、copy、direct、sunflower 或 per_file")
         return value
 
     @field_validator('min_size', mode='before')
@@ -125,11 +125,13 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
     clear_files = data.clear_files
     if share_mode == "sunflower" and not data.target_channels:
         return {"state": False, "message": "葵花宝典模式必须选择至少一个推送频道"}
+    if share_mode == "per_file" and not data.target_channels:
+        return {"state": False, "message": "逐条分享模式必须选择至少一个推送频道"}
     if share_mode == "move" and not clear_files:
         share_mode = "copy"
     elif share_mode == "direct":
         clear_files = False
-    elif share_mode in {"copy", "sunflower"}:
+    elif share_mode in {"copy", "sunflower", "per_file"}:
         clear_files = False
     elif share_mode == "move":
         clear_files = True
@@ -188,6 +190,8 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
         resulting_channels = update_dict.get("target_channels", task.target_channels)
         if resulting_share_mode == "sunflower" and not resulting_channels:
             return {"state": False, "message": "葵花宝典模式必须选择至少一个推送频道"}
+        if resulting_share_mode == "per_file" and not resulting_channels:
+            return {"state": False, "message": "逐条分享模式必须选择至少一个推送频道"}
         # Reconcile share_mode and clear_files if either is updated
         if "share_mode" in update_dict or "clear_files" in update_dict:
             curr_share_mode = update_dict.get("share_mode", task.share_mode or ("move" if task.clear_files else "copy"))
@@ -197,7 +201,7 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
                 curr_share_mode = "copy"
             elif curr_share_mode == "direct":
                 curr_clear_files = False
-            elif curr_share_mode in {"copy", "sunflower"}:
+            elif curr_share_mode in {"copy", "sunflower", "per_file"}:
                 curr_clear_files = False
             elif curr_share_mode == "move":
                 curr_clear_files = True

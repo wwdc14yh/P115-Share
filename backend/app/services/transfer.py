@@ -8,7 +8,7 @@ from app.core.database import async_session
 from app.models.schema import P115Account, ScheduledTransferTask
 from loguru import logger
 from p115client import P115Client, check_response, tool
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 NON_MEMBER_MAX_FILE_SIZE = 5 * 1024**3
 
@@ -25,6 +25,7 @@ async def _set_task_status(task_id: int, status: str) -> None:
         if task is None:
             raise ValueError(f"Scheduled transfer task {task_id} no longer exists")
         task.status = status
+        task.last_run_at = datetime.now(UTC).replace(tzinfo=None)
         await session.commit()
 
 
@@ -102,40 +103,62 @@ def _format_file_size(size_bytes: int) -> str:
 async def run_transfer_task(task_id: int) -> int:
     """递归转移任务源目录中的文件到目标目录，并返回成功转移的文件数。"""
     async with async_session() as session:
+        started_at = datetime.now(UTC).replace(tzinfo=None)
+        result = await session.execute(
+            update(ScheduledTransferTask)
+            .where(
+                ScheduledTransferTask.id == task_id,
+                ScheduledTransferTask.status != "running",
+            )
+            .values(status="running", last_run_at=started_at)
+        )
+        if result.rowcount == 0:
+            task = await session.get(ScheduledTransferTask, task_id)
+            if task is None:
+                raise ValueError(f"Scheduled transfer task {task_id} not found")
+            logger.info(f"跨账号转存任务 {task_id} 已在运行中，跳过本次执行")
+            return 0
+
+        await session.commit()
         task = await session.get(ScheduledTransferTask, task_id)
         if task is None:
             raise ValueError(f"Scheduled transfer task {task_id} not found")
-        if task.source_account_id == task.target_account_id:
-            raise ValueError("源账号和目标账号不能相同")
 
-        account_ids = {task.source_account_id, task.target_account_id}
-        result = await session.execute(
-            select(P115Account).where(P115Account.id.in_(account_ids))
-        )
-        accounts = {account.id: account for account in result.scalars().all()}
-        source_account = accounts.get(task.source_account_id)
-        target_account = accounts.get(task.target_account_id)
-        if source_account is None:
-            raise ValueError(f"源账号 {task.source_account_id} 不存在")
-        if target_account is None:
-            raise ValueError(f"目标账号 {task.target_account_id} 不存在")
-        if not source_account.cookie:
-            raise ValueError(f"源账号 {task.source_account_id} 未配置 Cookie")
-        if not target_account.cookie:
-            raise ValueError(f"目标账号 {task.target_account_id} 未配置 Cookie")
-        if not task.source_dir_path.strip():
-            raise ValueError("源目录路径不能为空")
-        if not task.target_dir_path.strip():
-            raise ValueError("目标目录路径不能为空")
+        try:
+            if task.source_account_id == task.target_account_id:
+                raise ValueError("源账号和目标账号不能相同")
 
-        # 只将后续网络操作所需的标量值带出会话，整个文件传输过程不持有 DB 连接。
-        source_cookie = source_account.cookie
-        target_cookie = target_account.cookie
-        source_path = task.source_dir_path
-        target_path = task.target_dir_path
-        task.status = "running"
-        task.last_run_at = datetime.now(UTC).replace(tzinfo=None)
-        await session.commit()
+            account_ids = {task.source_account_id, task.target_account_id}
+            result = await session.execute(
+                select(P115Account).where(P115Account.id.in_(account_ids))
+            )
+            accounts = {account.id: account for account in result.scalars().all()}
+            source_account = accounts.get(task.source_account_id)
+            target_account = accounts.get(task.target_account_id)
+            if source_account is None:
+                raise ValueError(f"源账号 {task.source_account_id} 不存在")
+            if target_account is None:
+                raise ValueError(f"目标账号 {task.target_account_id} 不存在")
+            if not source_account.cookie:
+                raise ValueError(f"源账号 {task.source_account_id} 未配置 Cookie")
+            if not target_account.cookie:
+                raise ValueError(f"目标账号 {task.target_account_id} 未配置 Cookie")
+            if not task.source_dir_path.strip():
+                raise ValueError("源目录路径不能为空")
+            if not task.target_dir_path.strip():
+                raise ValueError("目标目录路径不能为空")
+
+            # 只将后续网络操作所需的标量值带出会话，整个文件传输过程不持有 DB 连接。
+            source_cookie = source_account.cookie
+            target_cookie = target_account.cookie
+            source_path = task.source_dir_path
+            target_path = task.target_dir_path
+        except Exception:
+            task.status = "failed"
+            task.last_run_at = datetime.now(UTC).replace(tzinfo=None)
+            await session.commit()
+            logger.exception(f"跨账号转存任务 {task_id} 初始化失败")
+            raise
 
     try:
         source_client = create_p115_client(source_cookie)
@@ -177,6 +200,7 @@ async def run_transfer_task(task_id: int) -> int:
 
         transferred_count = 0
         skipped_large_file_count = 0
+        failed_file_count = 0
         async for file_info in files:
             file_name = str(file_info.get("name") or file_info.get("id") or "未知文件")
             file_size = _file_size_bytes(file_info)
@@ -196,37 +220,46 @@ async def run_transfer_task(task_id: int) -> int:
                 await tg_service.send_admin_msg(warning)
                 continue
 
-            # 只在两次实际转移之间等待，避免首个文件前和最后一个文件后无意义地延迟。
-            if transferred_count:
-                delay = random.uniform(30, 60)
-                logger.info(
-                    f"跨账号转存任务 {task_id}：等待 {delay:.1f} 秒后转移下一个文件"
-                )
-                await asyncio.sleep(delay)
+            delay = random.uniform(3, 10)
+            logger.info(
+                f"跨账号转存任务 {task_id}：等待 {delay:.1f} 秒后转移文件 {file_name}"
+            )
+            await asyncio.sleep(delay)
 
             # file_info 是 p115client 迭代器返回的源文件信息字典；transferfile
             # 依据其中的文件 ID、名称和哈希读取源文件，并将其上传到目标目录 ID。
-            response = await tool.edit.transferfile(
-                source_client,
-                target_client,
-                file_info,
-                pid=target_dir_id,
-                app="web",
-                async_=True,
-            )
-            check_response(response)
+            try:
+                response = await tool.edit.transferfile(
+                    source_client,
+                    target_client,
+                    file_info,
+                    pid=target_dir_id,
+                    app="web",
+                    async_=True,
+                )
+                check_response(response)
+            except Exception:
+                failed_file_count += 1
+                logger.exception(
+                    f"跨账号转存任务 {task_id}：转移 {file_name} 失败，跳过当前文件"
+                )
+                continue
+
             transferred_count += 1
             logger.info(
                 f"跨账号转存任务 {task_id}：已转移 {file_name}"
             )
 
         if transferred_count == 0:
-            logger.info(f"跨账号转存任务 {task_id}：源目录中没有文件，跳过转移")
+            logger.info(f"跨账号转存任务 {task_id}：没有文件成功转移")
 
-        await _set_task_status(task_id, "success")
+        await _set_task_status(
+            task_id, "failed" if failed_file_count else "success"
+        )
         logger.info(
             f"跨账号转存任务 {task_id} 完成，共转移 {transferred_count} 个文件，"
-            f"因非会员限制跳过 {skipped_large_file_count} 个文件"
+            f"因非会员限制跳过 {skipped_large_file_count} 个文件，"
+            f"转存失败跳过 {failed_file_count} 个文件"
         )
         return transferred_count
     except Exception:
