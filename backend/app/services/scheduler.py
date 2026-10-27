@@ -27,6 +27,7 @@ SCHEDULED_SHARE_CLEANUP_DELAY = 60
 PER_FILE_COPY_STABLE_SAMPLES = 3
 PER_FILE_COPY_NO_PROGRESS_TIMEOUT = 15 * 60
 PER_FILE_COPY_ABSOLUTE_TIMEOUT = 2 * 60 * 60
+_scheduled_share_link_lock = asyncio.Lock()
 
 
 class MoveProgressFailed(RuntimeError):
@@ -453,6 +454,14 @@ async def _per_file_pause(operation: str, minimum: float = 5, maximum: float = 1
     await asyncio.sleep(delay)
 
 
+async def _create_scheduled_serial_share_link(svc, fids: list) -> str | None:
+    async with _scheduled_share_link_lock:
+        delay = random.uniform(180, 360)
+        logger.info("⏱️ 定时逐条/葵花宝典分享：创建分享链接前等待 %.1f 秒", delay)
+        await asyncio.sleep(delay)
+        return await svc._share_fids_direct(fids)
+
+
 async def _broadcast_per_file_until_delivered(
     tg_service,
     share_link: str,
@@ -742,7 +751,7 @@ async def _run_per_file_share_mode(
                 logger.info("ℹ️ 未发现 TMDB 标识或文件名无需调整，副本保持原名：%s", source_name)
 
             await _per_file_pause(f"为文件副本 {sanitized_name} 创建分享链接")
-            share_link = await svc._share_fids_direct([copied_id])
+            share_link = await _create_scheduled_serial_share_link(svc, [copied_id])
             if not share_link:
                 raise RuntimeError(f"为文件副本 {sanitized_name} 创建分享链接失败")
             share_created = True
@@ -1042,7 +1051,7 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
                         logger.info("✏️ 文件名脱敏：%s -> %s", old_name, new_name)
 
             await _sunflower_pause(f"为副本目录 {standardized_name} 创建分享链接")
-            share_link = await svc._share_fids_direct([stage_cid])
+            share_link = await _create_scheduled_serial_share_link(svc, [stage_cid])
             if not share_link:
                 raise RuntimeError(f"为副本目录 {standardized_name} 创建分享链接失败")
             share_created = True
@@ -1690,9 +1699,25 @@ class CleanupScheduler:
                 self.scheduler.remove_job(job_id)
                 logger.info(f"[-] 已移除定时分享任务 [{task.id}] '{task.name}'")
 
+    async def _reset_interrupted_share_tasks(self):
+        async with async_session() as session:
+            result = await session.execute(
+                select(ScheduledShareTask).where(ScheduledShareTask.status == "running")
+            )
+            stale_tasks = result.scalars().all()
+            for task in stale_tasks:
+                task.status = "waiting" if task.enabled else "disabled"
+            if stale_tasks:
+                await session.commit()
+                logger.warning(
+                    "♻️ 启动恢复：已重置 %s 个意外中断的定时分享任务状态",
+                    len(stale_tasks),
+                )
+
     async def sync_all_scheduled_share_jobs(self):
         """加载并同步所有启用的定时分享任务"""
         try:
+            await self._reset_interrupted_share_tasks()
             async with async_session() as session:
                 result = await session.execute(select(ScheduledShareTask))
                 tasks = result.scalars().all()

@@ -145,8 +145,12 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
     async def copy_complete(*_args, **_kwargs):
         return {}
 
+    async def create_share_link(service, fids):
+        return await service._share_fids_direct(fids)
+
     with (
         patch.object(scheduler, "_sunflower_pause", no_pause),
+        patch.object(scheduler, "_create_scheduled_serial_share_link", create_share_link),
         patch.object(scheduler, "_wait_transfer_complete", copy_complete),
         patch("app.services.tg_bot.tg_service", tg),
     ):

@@ -160,6 +160,82 @@ async def test_scheduled_run_skips_when_task_is_already_running():
         await scheduler._run_scheduled_share_task(1)
 
 
+async def test_startup_resets_interrupted_scheduled_share_statuses():
+    tasks = [
+        SimpleNamespace(enabled=True, status="running"),
+        SimpleNamespace(enabled=False, status="running"),
+    ]
+    committed = False
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return tasks
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return FakeResult()
+
+        async def commit(self):
+            nonlocal committed
+            committed = True
+
+    with patch.object(scheduler, "async_session", FakeSession):
+        await scheduler.cleanup_scheduler._reset_interrupted_share_tasks()
+
+    assert [task.status for task in tasks] == ["waiting", "disabled"]
+    assert committed
+
+
+async def test_scheduled_share_link_creation_is_serialized_and_delayed():
+    original_sleep = asyncio.sleep
+    requested_ranges = []
+    events = []
+    active_creations = 0
+    max_active_creations = 0
+
+    class FakeService:
+        async def _share_fids_direct(self, fids):
+            nonlocal active_creations, max_active_creations
+            active_creations += 1
+            max_active_creations = max(max_active_creations, active_creations)
+            events.append(("create", fids))
+            await original_sleep(0)
+            active_creations -= 1
+            return f"share-{fids[0]}"
+
+    async def fake_sleep(delay):
+        events.append(("wait", delay))
+        await original_sleep(0)
+
+    def fake_uniform(minimum, maximum):
+        requested_ranges.append((minimum, maximum))
+        return minimum
+
+    with (
+        patch.object(scheduler, "_scheduled_share_link_lock", asyncio.Lock()),
+        patch.object(scheduler.asyncio, "sleep", fake_sleep),
+        patch.object(scheduler.random, "uniform", fake_uniform),
+    ):
+        results = await asyncio.gather(
+            scheduler._create_scheduled_serial_share_link(FakeService(), [1]),
+            scheduler._create_scheduled_serial_share_link(FakeService(), [2]),
+        )
+
+    assert results == ["share-1", "share-2"]
+    assert requested_ranges == [(180, 360), (180, 360)]
+    assert max_active_creations == 1
+    assert [event[0] for event in events] == ["wait", "create", "wait", "create"]
+
+
 async def test_stable_source_snapshot_resets_after_error():
     expected = snapshot(1, [{"id": "a", "name": "A", "is_dir": True}], 10, 1, 1)
     responses = [expected, RuntimeError("temporary"), expected, expected]
@@ -514,6 +590,8 @@ async def main():
     await test_scheduled_share_status_accepts_ready_link()
     await test_trigger_task_rejects_repeated_calls_until_completion()
     await test_scheduled_run_skips_when_task_is_already_running()
+    await test_startup_resets_interrupted_scheduled_share_statuses()
+    await test_scheduled_share_link_creation_is_serialized_and_delayed()
     await test_stable_source_snapshot_resets_after_error()
     await test_copy_waits_for_complete_stats_and_duplicate_names()
     await test_move_allows_new_source_items_after_snapshot()

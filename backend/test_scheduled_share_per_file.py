@@ -189,8 +189,12 @@ def test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery():
     async def no_sleep(delay):
         retry_delays.append(delay)
 
+    async def create_share_link(service, fids):
+        return await service._share_fids_direct(fids)
+
     with (
         patch.object(scheduler, "_per_file_pause", no_pause),
+        patch.object(scheduler, "_create_scheduled_serial_share_link", create_share_link),
         patch.object(scheduler.asyncio, "sleep", no_sleep),
         patch("app.services.tg_bot.tg_service", tg),
     ):
