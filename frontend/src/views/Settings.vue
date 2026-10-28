@@ -73,6 +73,13 @@
             <a-input v-model:value="formState.tg_allow_chats" placeholder="允许使用机器人的 ID (多个用逗号分隔)" />
           </a-form-item>
 
+          <a-form-item label="长期分享链接跳过">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">开启后，机器人检测到 115 链接为长期有效时，将跳过转存并直接推送原链接；其他链接仍按原流程处理。</div>
+            </template>
+            <a-switch v-model:checked="formState.tg_skip_long_term_shares" />
+          </a-form-item>
+
           <a-form-item label="审核超时时间 (小时)" name="tg_poll_timeout_hours">
             <template #extra>
               <div style="font-size: 12px; color: #999; margin-top: 4px">链接审核轮询的最大等待时长，超过后将停止轮询并提示手动检查</div>
@@ -269,6 +276,7 @@ const formState = reactive({
   tg_user_id: '',
   tg_allow_chats: '',
   tg_skip_large_package: false,
+  tg_skip_long_term_shares: false,
   tg_poll_timeout_hours: 6,
   proxy_enabled: false,
   proxy_host: '',
@@ -332,6 +340,7 @@ const loadConfig = async () => {
     formState.tg_user_id = res.data.tg_user_id || '';
     formState.tg_allow_chats = res.data.tg_allow_chats || '';
     formState.tg_skip_large_package = res.data.tg_skip_large_package || false;
+    formState.tg_skip_long_term_shares = res.data.tg_skip_long_term_shares || false;
     formState.tg_poll_timeout_hours = res.data.tg_poll_timeout_hours !== undefined ? res.data.tg_poll_timeout_hours : 6;
     
     // Handle tg_channels JSON
@@ -377,7 +386,7 @@ const loadConfig = async () => {
 const onFinish = async (section: 'tg' | 'proxy' | 'save' | 'tmdb' | 'mh' = 'tg') => {
   try {
     const sectionFields: Record<string, string[]> = {
-      tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package', 'tg_poll_timeout_hours'],
+      tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package', 'tg_skip_long_term_shares', 'tg_poll_timeout_hours'],
       proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type'],
       save: ['direct_save_account_id', 'direct_save_dir', 'tg_default_command_mode'],
       tmdb: ['tmdb_api_key'],

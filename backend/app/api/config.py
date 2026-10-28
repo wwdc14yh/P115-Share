@@ -20,6 +20,7 @@ class ConfigUpdate(BaseModel):
     tg_allow_chats: Optional[str] = None
     tg_channels: Optional[str] = None
     tg_skip_large_package: Optional[bool] = None
+    tg_skip_long_term_shares: Optional[bool] = None
     p115_cookie: Optional[str] = None
     p115_save_dir: Optional[str] = None
     p115_cleanup_dir_cron: Optional[str] = None
@@ -98,6 +99,8 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
         stage_setting("TG_CHANNELS", cfg.tg_channels)
     if "tg_skip_large_package" in update_data and settings.TG_SKIP_LARGE_PACKAGE != cfg.tg_skip_large_package:
         stage_setting("TG_SKIP_LARGE_PACKAGE", cfg.tg_skip_large_package)
+    if "tg_skip_long_term_shares" in update_data and settings.TG_SKIP_LONG_TERM_SHARES != cfg.tg_skip_long_term_shares:
+        stage_setting("TG_SKIP_LONG_TERM_SHARES", cfg.tg_skip_long_term_shares)
     
     # 2. Update 115 settings
     if "p115_cookie" in update_data and settings.P115_COOKIE != cfg.p115_cookie:
@@ -239,6 +242,7 @@ async def get_config(user=Depends(get_current_user)):
         "tg_allow_chats": settings.TG_ALLOW_CHATS,
         "tg_channels": settings.TG_CHANNELS,
         "tg_skip_large_package": settings.TG_SKIP_LARGE_PACKAGE,
+        "tg_skip_long_term_shares": settings.TG_SKIP_LONG_TERM_SHARES,
         "p115_cookie": settings.P115_COOKIE,
         "p115_logged_in": p115_service.is_connected,
         "p115_restricted": p115_service.is_restricted,

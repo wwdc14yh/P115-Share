@@ -71,6 +71,27 @@ def sizes_approximately_equal(a: int, b: int, *, rel_tol: float = 0.002, abs_tol
     return abs(a - b) <= max(abs_tol, int(max(a, b) * rel_tol))
 
 
+def _is_long_term_share(share_info: dict[str, Any]) -> bool:
+    expiry_fields = ("expire", "end", "duration", "valid", "period", "time")
+    long_term_markers = ("长期", "永久", "forever", "permanent")
+    pending = [share_info]
+    while pending:
+        current = pending.pop()
+        for field, value in current.items():
+            if isinstance(value, dict):
+                pending.append(value)
+                continue
+            normalized_field = str(field).lower()
+            if not any(marker in normalized_field for marker in expiry_fields):
+                continue
+            normalized_value = str(value).strip().lower()
+            if any(marker in normalized_value for marker in long_term_markers):
+                return True
+            if normalized_value == "-1":
+                return True
+    return False
+
+
 # iOS 用户代理
 # app="ios" 对应 ssoent=D1，即「115生活_苹果端」，UA 必须使用 115Life iOS 客户端 UA
 # 注意：「115_苹果端（网盘）」的 app="115ios"，ssoent=D3，两者不能混用
@@ -2110,15 +2131,23 @@ class P115Service:
                     pass
             share_title = share_info.get("share_title", "")
             have_vio_file = share_info.get("have_vio_file", 0)
+            try:
+                have_vio_file = int(have_vio_file)
+            except (TypeError, ValueError):
+                have_vio_file = 0
             
             is_snapshotting = "正在生成文件快照" in str(snap_resp)
+            is_expired = share_state == 7
+            is_prohibited = have_vio_file == 1
             res = {
                 "share_state": share_state,
                 "is_auditing": share_state == 0,
                 "is_snapshotting": is_snapshotting,
                 "is_pending": share_state == 0 or is_snapshotting,
-                "is_expired": share_state == 7,
-                "is_prohibited": have_vio_file == 1,
+                "is_expired": is_expired,
+                "is_prohibited": is_prohibited,
+                "is_long_term": _is_long_term_share({**data, **share_info}),
+                "is_normal": share_state == 1 and not is_snapshotting and not is_expired and not is_prohibited,
                 "title": share_title
             }
             if is_snapshotting:

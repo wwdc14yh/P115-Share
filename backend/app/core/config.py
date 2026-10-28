@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     TG_ALLOW_CHATS: str = "" # Comma separated list of IDs
     TG_CHANNELS: str = "[]"  # JSON list of {id, enabled, concise}
     TG_SKIP_LARGE_PACKAGE: bool = True
+    TG_SKIP_LONG_TERM_SHARES: bool = False
     TG_POLL_TIMEOUT_HOURS: int = 6  # 审核轮询超时时间（小时）
     
     # 115

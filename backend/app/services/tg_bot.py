@@ -358,8 +358,26 @@ class TGService:
                     "command_mode": command_mode
                 }
 
-                # 0. Check history first (Only for share mode)
                 if command_mode == "share":
+                    share_status = await svc.get_share_status(share_url)
+                    if share_status and not share_status.get("is_pending") and share_status.get("is_prohibited"):
+                        logger.warning(f"🚫 分享链接包含违规内容，停止处理: {share_url}")
+                        await message.reply("🚫 分享链接包含违规内容，已停止处理")
+                        return {"error_type": "violated", "message": "分享链接包含违规内容"}, None
+                    if (
+                        settings.TG_SKIP_LONG_TERM_SHARES
+                        and share_status
+                        and share_status.get("is_normal")
+                        and share_status.get("is_long_term")
+                    ):
+                        logger.info(f"⏭️ 检测到长期有效分享链接，跳过转存并推送原链接: {share_url}")
+                        await message.reply("✅ 此链接为长期分享，已跳过转存并推送原链接")
+                        return True, share_url
+
+                # 0. Check history first (Only for share mode)
+                if command_mode == "share" and not (
+                    share_status and share_status.get("is_pending")
+                ):
                     history_share_link = await svc.get_history_link(share_url)
 
                     if history_share_link:
@@ -807,11 +825,6 @@ class TGService:
                 logger.warning(f"⚠️ 无法获取检查状态，将在下次重试: {share_url}")
                 continue
 
-            if status_info["is_prohibited"]:
-                logger.warning(f"⚠️ 轮询检测到链接包含违规内容标志: {share_url}")
-                # 不再直接终止，允许在后续 is_auditing 为 false 时尝试转存
-
-
             if status_info["is_expired"]:
                 logger.warning(f"⏰ 轮询检测到链接已过期: {share_url}")
                 if scheduled_review:
@@ -825,16 +838,23 @@ class TGService:
                 await self._delete_pending_task(pending_info.get("db_id"))
                 return
 
+            if status_info.get("is_prohibited"):
+                logger.warning(f"🚫 轮询检测到链接包含违规内容，停止处理: {share_url}")
+                if scheduled_review:
+                    await self._complete_scheduled_share_review(
+                        svc,
+                        pending_info,
+                        error="分享链接包含违规内容",
+                    )
+                else:
+                    if not silent:
+                        await message.reply(f"🚫 链接包含违规内容，已停止处理: {share_url}")
+                    await self._delete_pending_task(pending_info.get("db_id"))
+                return
+
             if not status_info["is_pending"]:  # Not pending anymore (Audit passed and Snapshot ready)
                 if scheduled_review:
-                    if status_info.get("is_prohibited"):
-                        await self._complete_scheduled_share_review(
-                            svc,
-                            pending_info,
-                            error="分享链接包含违规内容",
-                        )
-                    else:
-                        await self._complete_scheduled_share_review(svc, pending_info)
+                    await self._complete_scheduled_share_review(svc, pending_info)
                     return
 
                 # 如果之前处于受限状态，尝试转存前先清理限制标志（如果还没过时间，但外部可能解除了）
@@ -845,6 +865,26 @@ class TGService:
                 
                 # Check command mode
                 command_mode = metadata.get("command_mode", "share")
+
+                if (
+                    command_mode == "share"
+                    and settings.TG_SKIP_LONG_TERM_SHARES
+                    and status_info.get("is_normal")
+                    and status_info.get("is_long_term")
+                ):
+                    logger.info(f"⏭️ 审核通过的链接为长期有效，跳过转存并推送原链接: {share_url}")
+                    await self.broadcast_to_channels({share_url: share_url}, metadata)
+                    success_text = f"✅ 审核通过！此链接为长期分享，已跳过转存并推送原链接：\n{share_url}"
+                    is_admin_chat = settings.TG_USER_ID and str(message.chat.id) == str(settings.TG_USER_ID)
+                    if not silent:
+                        await message.reply(success_text)
+                    elif not is_admin_chat:
+                        try:
+                            await self.send_admin_msg(f"🔔 [后台任务] {success_text}")
+                        except Exception:
+                            logger.exception("长期分享审核完成后的管理员通知失败")
+                    await self._delete_pending_task(pending_info.get("db_id"))
+                    return
                 
                 # Determine correct service
                 save_svc = svc
