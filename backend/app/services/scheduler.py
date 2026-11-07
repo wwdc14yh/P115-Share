@@ -372,74 +372,11 @@ async def _cleanup_scheduled_temp_dir(
 
 
 TMDB_ID_PATTERN = re.compile(r"(?i)tmdb(?:id)?\s*[-_:= ]\s*(\d+)")
-YEAR_PATTERN = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 
 
 def _extract_sunflower_tmdb_id(name: str) -> str | None:
     match = TMDB_ID_PATTERN.search(name)
     return match.group(1) if match else None
-
-
-def _to_sunflower_pinyin(text: str) -> str:
-    """将中文段转为小写全拼，其他字符原样保留。"""
-    import pypinyin
-
-    parts = re.findall(r"[\u4e00-\u9fff]+|[^\u4e00-\u9fff]+", text)
-    return "".join(
-        "".join(pypinyin.lazy_pinyin(part, style=pypinyin.Style.NORMAL))
-        if re.fullmatch(r"[\u4e00-\u9fff]+", part)
-        else part
-        for part in parts
-    )
-
-
-def _sunflower_name_parts(name: str) -> tuple[str, str | None, str | None]:
-    """返回标准化目录名、TMDB ID 和目录标题；无 TMDB ID 时保留原名。"""
-    tmdb_id = _extract_sunflower_tmdb_id(name)
-    if not tmdb_id:
-        return name, None, None
-
-    year_match = YEAR_PATTERN.search(name)
-    year = year_match.group(1) if year_match else None
-    title = TMDB_ID_PATTERN.sub("", name)
-    title = YEAR_PATTERN.sub("", title)
-    title = re.sub(r"[\[\]{}()（）【】]", " ", title)
-    title = re.sub(r"\s+", " ", title).strip(" ._-")
-    pinyin_title = _to_sunflower_pinyin(title).strip()
-    standardized = pinyin_title
-    if year:
-        standardized += f" ({year})"
-    if standardized:
-        standardized += " "
-    standardized += f"[tmdbid={tmdb_id}]"
-    return standardized, tmdb_id, title
-
-
-def _sunflower_file_name(
-    file_name: str,
-    *,
-    source_dir_name: str,
-    source_title: str,
-    standardized_dir_name: str,
-) -> str:
-    """以规范目录名为文件前缀，并保留原文件的画质、集数和扩展名。"""
-    stem, extension = os.path.splitext(file_name)
-    if stem.casefold().startswith(standardized_dir_name.casefold()):
-        return file_name
-
-    remainder = stem
-    # 115 中常见的剧集文件以原目录标题开头；去掉该标题后再添加标准化前缀，
-    # 避免产生“拼音目录.中文原名.年份...”这样的双重标题。
-    for title in sorted({source_dir_name, source_title}, key=len, reverse=True):
-        if title and remainder.casefold().startswith(title.casefold()):
-            remainder = remainder[len(title):]
-            break
-    remainder = TMDB_ID_PATTERN.sub("", remainder, count=1)
-    remainder = remainder.lstrip(" ._-–—()[]{}（）【】")
-    remainder = _to_sunflower_pinyin(remainder)
-    if remainder:
-        return f"{standardized_dir_name}.{remainder}{extension}"
-    return f"{standardized_dir_name}{extension}"
 
 
 async def _sunflower_pause(operation: str, minimum: float = 5, maximum: float = 10) -> None:
@@ -452,6 +389,41 @@ async def _per_file_pause(operation: str, minimum: float = 5, maximum: float = 1
     delay = random.uniform(minimum, maximum)
     logger.info("⏱️ 逐条分享模式：%s 前等待 %.1f 秒", operation, delay)
     await asyncio.sleep(delay)
+
+
+async def _create_serial_temp_dir(svc, task_id: int, pause, purpose: str) -> tuple[str, int]:
+    """在账号配置的保存路径下创建本次分享的临时工作目录。"""
+    save_dir_cid = await svc._ensure_save_dir()
+    temp_dir_name = f".scheduled_share_{task_id}_{time.time_ns()}"
+    await pause(f"在账号保存路径 {svc.save_dir} 创建{purpose}临时目录")
+    create_resp = await svc._api_call_with_timeout(
+        svc.client.fs_makedirs_app,
+        temp_dir_name,
+        pid=save_dir_cid,
+        async_=True,
+        **svc._get_ios_ua_kwargs(),
+    )
+    check_response(create_resp)
+    create_data = create_resp.get("data")
+    if not isinstance(create_data, dict):
+        create_data = {}
+    temp_cid = int(
+        create_data.get("cid")
+        or create_data.get("id")
+        or create_resp.get("cid")
+        or create_resp.get("id")
+        or 0
+    )
+    if not temp_cid:
+        raise RuntimeError(f"在账号保存路径 {svc.save_dir} 创建{purpose}临时目录失败: {create_resp}")
+    logger.info(
+        "📁 已在账号保存路径创建%s临时目录：路径=%s/%s，CID=%s",
+        purpose,
+        svc.save_dir,
+        temp_dir_name,
+        temp_cid,
+    )
+    return temp_dir_name, temp_cid
 
 
 async def _create_scheduled_serial_share_link(svc, fids: list) -> str | None:
@@ -517,12 +489,9 @@ async def _collect_per_file_candidates(
 ) -> list[dict]:
     """递归收集文件，并为每个文件关联最近的 TMDB 媒体目录。"""
     files = []
-    root_context = None
-    if _extract_sunflower_tmdb_id(root_name):
-        standardized_name, _, source_title = _sunflower_name_parts(root_name)
-        root_context = (root_name, source_title, standardized_name)
+    root_context = root_name if _extract_sunflower_tmdb_id(root_name) else None
 
-    async def walk(current_cid: int, items: list, media_context: tuple | None) -> None:
+    async def walk(current_cid: int, items: list, media_context: str | None) -> None:
         for item in items:
             if not item["is_dir"]:
                 files.append({
@@ -535,8 +504,7 @@ async def _collect_per_file_candidates(
             child_name = item["name"]
             child_context = media_context
             if _extract_sunflower_tmdb_id(child_name):
-                standardized_name, _, source_title = _sunflower_name_parts(child_name)
-                child_context = (child_name, source_title, standardized_name)
+                child_context = child_name
 
             child_cid = int(item["id"])
             await _per_file_pause(f"读取文件目录 {child_name} (CID: {child_cid})")
@@ -656,7 +624,6 @@ async def _run_per_file_share_mode(
         raise_on_error=True,
         validate_only=True,
     )
-
     candidates = await _collect_per_file_candidates(svc, src_cid, items, root_name)
     logger.info(
         "📄 逐条分享模式启动：源目录 CID=%s，递归文件数=%s，目标频道=%s",
@@ -675,16 +642,8 @@ async def _run_per_file_share_mode(
         parent_cid = int(source_file["parent_cid"])
         media_context = source_file["media_context"]
         sanitized_name = source_name
-        if media_context:
-            source_dir_name, source_title, standardized_dir_name = media_context
-            sanitized_name = _sunflower_file_name(
-                source_name,
-                source_dir_name=source_dir_name,
-                source_title=source_title or "",
-                standardized_dir_name=standardized_dir_name,
-            )
-
         stage_cid = None
+        copy_target_cid = None
         share_link = None
         share_created = False
         files_deleted = False
@@ -700,55 +659,85 @@ async def _run_per_file_share_mode(
         )
 
         try:
-            unique_suffix = f"{task_id}_{time.time_ns() % 1_000_000:06d}"
-            staging_name = f".scheduled_share_{unique_suffix}"
-            await _per_file_pause(f"为文件 {source_name} 创建临时副本目录")
-            create_resp = await svc._api_call_with_timeout(
-                svc.client.fs_makedirs_app,
-                staging_name,
-                pid=parent_cid,
-                async_=True,
-                **svc._get_ios_ua_kwargs(),
+            _, stage_cid = await _create_serial_temp_dir(
+                svc, task_id, _per_file_pause, f"文件 {source_name} 的"
             )
-            check_response(create_resp)
-            create_data = create_resp.get("data")
-            if not isinstance(create_data, dict):
-                create_data = {}
-            stage_cid = int(
-                create_data.get("cid")
-                or create_data.get("id")
-                or create_resp.get("cid")
-                or create_resp.get("id")
-                or 0
-            )
-            if not stage_cid:
-                raise RuntimeError(f"创建文件临时副本目录后未返回 CID: {create_resp}")
-            logger.info("📁 文件临时副本目录已创建：%s (CID: %s)", staging_name, stage_cid)
+            copy_target_cid = stage_cid
+            if media_context:
+                source_dir_name = media_context
+                await _per_file_pause(
+                    f"在临时目录中保留 TMDB 目录上下文 {source_dir_name}"
+                )
+                media_dir_resp = await svc._api_call_with_timeout(
+                    svc.client.fs_makedirs_app,
+                    source_dir_name,
+                    pid=stage_cid,
+                    async_=True,
+                    **svc._get_ios_ua_kwargs(),
+                )
+                check_response(media_dir_resp)
+                media_dir_data = media_dir_resp.get("data")
+                if not isinstance(media_dir_data, dict):
+                    media_dir_data = {}
+                copy_target_cid = int(
+                    media_dir_data.get("cid")
+                    or media_dir_data.get("id")
+                    or media_dir_resp.get("cid")
+                    or media_dir_resp.get("id")
+                    or 0
+                )
+                if not copy_target_cid:
+                    raise RuntimeError(
+                        f"在临时目录中创建 TMDB 上下文目录失败: {media_dir_resp}"
+                    )
+                logger.info(
+                    "📁 已在临时目录中创建 TMDB 上下文：%s (CID: %s)",
+                    source_dir_name,
+                    copy_target_cid,
+                )
 
             await _per_file_pause(f"复制文件 {source_name} (FID: {source_id})")
             copy_resp = await svc._api_call_with_timeout(
                 svc.client.fs_copy_app,
                 [source_id],
-                pid=stage_cid,
+                pid=copy_target_cid,
                 async_=True,
                 **svc._get_ios_ua_kwargs(),
             )
             check_response(copy_resp)
-            copied_file = await _wait_for_single_file_copy(svc, stage_cid, source_name)
+            copied_file = await _wait_for_single_file_copy(
+                svc, copy_target_cid, source_name
+            )
             copied_id = str(copied_file["id"])
 
-            if sanitized_name != copied_file["name"]:
-                await _per_file_pause(f"脱敏副本文件名 {copied_file['name']} -> {sanitized_name}")
-                rename_resp = await svc._api_call_with_timeout(
-                    svc.client.fs_rename_app,
-                    (copied_id, sanitized_name),
-                    async_=True,
-                    **svc._get_ios_ua_kwargs(),
+            await _per_file_pause(
+                f"使用敏感词管理的 TMDB 别名规则处理副本 {source_name}"
+            )
+            await svc.replace_sensitive_words_in_dir(
+                stage_cid,
+                replace_enabled=True,
+                replace_pinyin="2",
+                replace_tmdb=True,
+            )
+            copied_items = await svc._get_dir_items(copy_target_cid, strict=True)
+            copied_file = next(
+                (
+                    item
+                    for item in copied_items
+                    if str(item["id"]) == copied_id and not item["is_dir"]
+                ),
+                None,
+            )
+            if copied_file is None:
+                raise RuntimeError(
+                    f"敏感词/TMDB 脱敏后无法重新读取临时副本：{source_name} (FID: {copied_id})"
                 )
-                check_response(rename_resp)
-                logger.info("✏️ 副本文件脱敏完成：%s -> %s", copied_file["name"], sanitized_name)
-            else:
-                logger.info("ℹ️ 未发现 TMDB 标识或文件名无需调整，副本保持原名：%s", source_name)
+            sanitized_name = copied_file["name"]
+            logger.info(
+                "✏️ 敏感词管理脱敏结果：原文件=%s，副本文件=%s",
+                source_name,
+                sanitized_name,
+            )
 
             await _per_file_pause(f"为文件副本 {sanitized_name} 创建分享链接")
             share_link = await _create_scheduled_serial_share_link(svc, [copied_id])
@@ -884,6 +873,12 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
         raise_on_error=True,
         validate_only=True,
     )
+    save_dir_cid = await svc._ensure_save_dir()
+    logger.info(
+        "🌻 葵花宝典临时副本目录：账号保存路径=%s，CID=%s",
+        svc.save_dir,
+        save_dir_cid,
+    )
 
     child_dirs = [item for item in items if item["is_dir"]]
     logger.info(
@@ -921,9 +916,11 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
         child_cid = int(child["id"])
         source_name = child["name"]
         stage_cid = None
+        copied_media_cid = None
         share_created = False
+        files_deleted = False
         delivery_registered = False
-        standardized_name, tmdb_id, source_title = _sunflower_name_parts(source_name)
+        tmdb_id = _extract_sunflower_tmdb_id(source_name)
         logger.info(
             "🌻 开始处理第 %s/%s 个目录：%s (CID: %s)，TMDB ID=%s",
             index,
@@ -944,32 +941,40 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
                 logger.info("📂 目录在预检后已变为空，跳过：%s", source_name)
                 continue
 
-            unique_suffix = f"{task_id}_{time.time_ns() % 1_000_000:06d}"
-            staging_name = f"{source_name}（副本）_{unique_suffix}"
-            await _sunflower_pause(f"创建副本目录 {staging_name}")
-            create_resp = await svc._api_call_with_timeout(
+            staging_name, stage_cid = await _create_serial_temp_dir(
+                svc, task_id, _sunflower_pause, f"目录 {source_name} 的"
+            )
+            await _sunflower_pause(f"在临时目录中保留 TMDB 目录上下文 {source_name}")
+            media_dir_resp = await svc._api_call_with_timeout(
                 svc.client.fs_makedirs_app,
-                staging_name,
-                pid=src_cid,
+                source_name,
+                pid=stage_cid,
                 async_=True,
                 **svc._get_ios_ua_kwargs(),
             )
-            check_response(create_resp)
-            create_data = create_resp.get("data")
-            if not isinstance(create_data, dict):
-                create_data = {}
-            stage_cid = int(
-                create_data.get("cid")
-                or create_data.get("id")
-                or create_resp.get("cid")
-                or create_resp.get("id")
+            check_response(media_dir_resp)
+            media_dir_data = media_dir_resp.get("data")
+            if not isinstance(media_dir_data, dict):
+                media_dir_data = {}
+            copied_media_cid = int(
+                media_dir_data.get("cid")
+                or media_dir_data.get("id")
+                or media_dir_resp.get("cid")
+                or media_dir_resp.get("id")
                 or 0
             )
-            if not stage_cid:
-                raise RuntimeError(f"创建副本目录后未返回 CID: {create_resp}")
-            logger.info("📁 副本目录已创建：%s (CID: %s)", staging_name, stage_cid)
+            if not copied_media_cid:
+                raise RuntimeError(f"创建临时 TMDB 上下文目录失败: {media_dir_resp}")
+            logger.info(
+                "📁 临时目录及媒体目录已就绪：保存路径=%s，临时目录=%s (CID: %s)，媒体目录=%s (CID: %s)",
+                svc.save_dir,
+                staging_name,
+                stage_cid,
+                source_name,
+                copied_media_cid,
+            )
 
-            # 将原子目录的所有直接子项复制到副本根目录，保留其内部层级。
+            # 将原子目录的所有直接子项复制到保存路径下的临时媒体目录，保留内部层级。
             source_ids = [item["id"] for item in source_snapshot["items"]]
             if not source_ids:
                 raise RuntimeError(f"目录快照为空，拒绝创建空副本：{source_name}")
@@ -977,7 +982,7 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
             copy_resp = await svc._api_call_with_timeout(
                 svc.client.fs_copy_app,
                 source_ids,
-                pid=stage_cid,
+                pid=copied_media_cid,
                 async_=True,
                 **svc._get_ios_ua_kwargs(),
             )
@@ -986,100 +991,58 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
                 svc,
                 mode="copy",
                 source_cid=child_cid,
-                target_cid=stage_cid,
+                target_cid=copied_media_cid,
                 baseline=source_snapshot,
                 poll_interval_range=(5, 10),
             )
-            logger.info("✅ 目录复制完成：%s -> %s (CID: %s)", source_name, staging_name, stage_cid)
+            logger.info(
+                "✅ 目录已复制到账号保存路径临时目录：源目录=%s，副本媒体目录 CID=%s",
+                source_name,
+                copied_media_cid,
+            )
 
-            # 只有发现 TMDB 标识的目录才更改目录名和文件名；其他目录保持原名。
-            if tmdb_id:
-                await _sunflower_pause(f"重命名副本目录为 {standardized_name}")
-                rename_resp = await svc._api_call_with_timeout(
-                    svc.client.fs_rename_app,
-                    (stage_cid, standardized_name),
-                    async_=True,
-                    **svc._get_ios_ua_kwargs(),
+            await _sunflower_pause(
+                f"使用敏感词管理的 TMDB 别名规则处理目录 {source_name}"
+            )
+            await svc.replace_sensitive_words_in_dir(
+                stage_cid,
+                replace_enabled=True,
+                replace_pinyin="2",
+                replace_tmdb=True,
+            )
+            stage_items = await svc._get_dir_items(stage_cid, strict=True)
+            copied_media_item = next(
+                (
+                    item
+                    for item in stage_items
+                    if str(item["id"]) == str(copied_media_cid) and item["is_dir"]
+                ),
+                None,
+            )
+            if copied_media_item is None:
+                raise RuntimeError(
+                    f"TMDB 脱敏后无法重新读取临时媒体目录：{source_name} (CID: {copied_media_cid})"
                 )
-                check_response(rename_resp)
-                logger.info("✏️ 副本目录脱敏完成：%s -> %s", source_name, standardized_name)
-            else:
-                await _sunflower_pause(f"移除副本目录后缀并恢复目录名 {source_name}")
-                rename_resp = await svc._api_call_with_timeout(
-                    svc.client.fs_rename_app,
-                    (stage_cid, source_name),
-                    async_=True,
-                    **svc._get_ios_ua_kwargs(),
-                )
-                check_response(rename_resp)
-                logger.info("ℹ️ 目录未包含 TMDB ID，已移除副本后缀，保留原名：%s", source_name)
+            display_name = copied_media_item["name"]
+            logger.info(
+                "✏️ 敏感词管理脱敏结果：原目录=%s，分享目录=%s，TMDB ID=%s",
+                source_name,
+                display_name,
+                tmdb_id or "未找到",
+            )
 
-            if tmdb_id:
-                copied_snapshot = await _read_dir_snapshot(svc, stage_cid)
-                copied_files = await _scan_sunflower_tree(
-                    svc, stage_cid, initial_items=copied_snapshot["items"]
-                )
-                rename_items = []
-                for copied_file in copied_files:
-                    new_name = _sunflower_file_name(
-                        copied_file["name"],
-                        source_dir_name=source_name,
-                        source_title=source_title or "",
-                        standardized_dir_name=standardized_name,
-                    )
-                    if new_name != copied_file["name"]:
-                        rename_items.append((copied_file["id"], new_name, copied_file["name"]))
-
-                logger.info(
-                    "📝 递归文件脱敏完成：待重命名 %s 个文件（总文件 %s 个）",
-                    len(rename_items),
-                    len(copied_files),
-                )
-                for batch_start in range(0, len(rename_items), 100):
-                    batch = rename_items[batch_start:batch_start + 100]
-                    await _sunflower_pause(
-                        f"批量重命名文件 {batch_start + 1}-{batch_start + len(batch)}"
-                    )
-                    rename_files_resp = await svc._api_call_with_timeout(
-                        svc.client.fs_rename_app,
-                        [(fid, new_name) for fid, new_name, _ in batch],
-                        async_=True,
-                        **svc._get_ios_ua_kwargs(),
-                    )
-                    check_response(rename_files_resp)
-                    for _, new_name, old_name in batch:
-                        logger.info("✏️ 文件名脱敏：%s -> %s", old_name, new_name)
-
-            await _sunflower_pause(f"为副本目录 {standardized_name} 创建分享链接")
-            share_link = await _create_scheduled_serial_share_link(svc, [stage_cid])
+            await _sunflower_pause(f"为临时媒体目录 {display_name} 创建分享链接")
+            share_link = await _create_scheduled_serial_share_link(svc, [copied_media_cid])
             if not share_link:
-                raise RuntimeError(f"为副本目录 {standardized_name} 创建分享链接失败")
+                raise RuntimeError(f"为临时媒体目录 {display_name} 创建分享链接失败")
             share_created = True
             logger.info("🔗 分享链接创建成功：目录=%s，链接=%s", source_name, share_link)
 
-            full_text = f"🌻 葵花宝典定时分享：{standardized_name}\n🔗 链接：{share_link}"
-            metadata = {"full_text": full_text, "entities": [], "photo_id": None}
-            await _sunflower_pause(f"推送分享链接到频道 {target_channels}")
-            await tg_service.broadcast_to_channels(
-                {share_link: share_link},
-                metadata,
-                channel_ids=target_channels,
-                raise_on_error=True,
+            logger.info(
+                "🗑️ 分享链接已创建，立即删除临时副本和原目录：副本 CID=%s，原目录 CID=%s",
+                stage_cid,
+                child_cid,
             )
-            delivery_registered = True
-            logger.info("📢 分享链接已直接推送到频道（不检查审核状态）：%s", share_link)
-
-            await _sunflower_pause(
-                f"频道推送完成后的后续操作 {share_link}",
-                minimum=180,
-                maximum=420,
-            )
-
-            # 该模式明确要求分享创建后立即删除副本和原子目录；不清空整个回收站，
-            # 以免误删该账号中与本任务无关的已删除文件。
-            if not delivery_registered:
-                raise RuntimeError("频道推送未登记，保留原目录和副本")
-            await _sunflower_pause(f"删除副本和原目录 {source_name}")
             delete_resp = await svc._api_call_with_timeout(
                 svc.client.fs_delete_app,
                 [stage_cid, child_cid],
@@ -1087,23 +1050,41 @@ async def _run_sunflower_share_mode(svc, task_db, task_id: int, src_cid: int, it
                 **svc._get_ios_ua_kwargs(),
             )
             check_response(delete_resp)
+            files_deleted = True
             logger.info(
-                "🗑️ 副本与原子目录已移入回收站：副本 CID=%s，原目录 CID=%s",
+                "✅ 临时副本和原目录已移入回收站：副本 CID=%s，原目录 CID=%s",
                 stage_cid,
                 child_cid,
             )
 
+            metadata = {
+                "full_text": f"🌻 葵花宝典定时分享：{source_name}\n🔗 链接：{share_link}",
+                "entities": [],
+                "photo_id": None,
+                "scheduled_share_per_file": True,
+            }
+            await _broadcast_per_file_until_delivered(
+                tg_service,
+                share_link,
+                metadata,
+                target_channels,
+                source_name,
+            )
+            delivery_registered = True
+            logger.info("📢 原目录名及分享链接已成功推送到所有目标频道：%s", source_name)
+
         except Exception as exc:
             logger.error(  # noqa: G201
-                "❌ 葵花宝典模式处理目录失败：%s (CID: %s)，分享创建=%s，推送登记=%s，错误=%s",
+                "❌ 葵花宝典模式处理目录失败：%s (CID: %s)，分享创建=%s，副本及原目录已清理=%s，推送登记=%s，错误=%s",
                 source_name,
                 child_cid,
                 share_created,
+                files_deleted,
                 delivery_registered,
                 exc,
                 exc_info=True,
             )
-            # 只有分享未创建时才清理临时副本；分享创建或推送失败时保留文件以便恢复。
+            # 分享未创建时清理临时副本；分享创建后清理和推送由对应步骤负责。
             if stage_cid and not share_created:
                 try:
                     await _sunflower_pause(f"失败后清理未分享副本 CID={stage_cid}")

@@ -135,8 +135,8 @@
               <span v-if="formState.share_mode === 'move'">移动模式：原目录文件会被直接剪切移动到临时目录，原目录自动清空，速度极快且不占额外空间（适合增量分享/追更）。</span>
               <span v-else-if="formState.share_mode === 'copy'">复制模式：原目录文件会被复制一份进行分享，原目录文件保持不动，但下次会重复分享（适合全量分享/归档）。</span>
               <span v-else-if="formState.share_mode === 'direct'">直接分享模式：直接对原目录（源目录本身）进行分享，不创建临时文件夹，不移动或复制任何文件，原目录文件保持不动。</span>
-              <span v-else-if="formState.share_mode === 'sunflower'">葵花宝典模式：为路径下每个含文件的直接子目录单独创建分享；仅识别到 TMDB ID 的目录会规范化为拼音标题，并给递归文件名添加目录标题前缀。分享创建后直接推送频道，不检查审核状态；每次网盘操作等待 5–10 秒，每个目录处理完成后等待 3–7 分钟再处理下一个。推送成功后副本和原子目录会移入回收站；不会清空整个回收站。</span>
-              <span v-else-if="formState.share_mode === 'per_file'">逐条分享模式：递归处理目录中的每个文件，每个文件单独复制、按所属 TMDB 目录脱敏并创建分享链接，推送时显示原文件名。分享链接创建后立即删除副本和原文件并推送频道；推送失败时每隔 2–4 分钟自动重试，直至成功。处理结束后清理空子目录。</span>
+              <span v-else-if="formState.share_mode === 'sunflower'">葵花宝典模式：为路径下每个含文件的直接子目录单独创建分享；副本会放入账号设置的保存路径临时目录，并使用敏感词管理中的 TMDB 别名规则处理名称，TMDB 调用重试后失败时回退拼音。分享链接创建后立即删除副本及原目录并推送原目录名；推送失败时每隔 2–4 分钟重试，直至成功。每个目录处理完成后等待 3–7 分钟再处理下一个，不会清空整个回收站。</span>
+              <span v-else-if="formState.share_mode === 'per_file'">逐条分享模式：递归处理目录中的每个文件，副本放入账号设置的保存路径临时目录，并使用敏感词管理中的 TMDB 别名规则脱敏；TMDB 调用重试后失败时回退拼音。分享链接创建后立即删除副本和原文件并推送原文件名；推送失败时每隔 2–4 分钟重试，直至成功。处理结束后清理空子目录。</span>
             </div>
           </template>
           <a-select v-model:value="formState.share_mode">
@@ -229,7 +229,7 @@
         <a-alert message="安全警示" description="此任务会在分享成功后删除临时目录，并清空该 115 账号的整个回收站。请确保回收站中没有需要保留的文件。" type="warning" show-icon />
       </div>
       <div v-if="formState.share_mode === 'sunflower'" style="margin-top: 12px">
-        <a-alert message="葵花宝典模式会删除原始子目录" description="每个分享链接创建并成功推送到频道后，副本和对应原始子目录都会被移入 115 回收站。请确认这些原始文件可以删除；本模式不会清空回收站。" type="warning" show-icon />
+        <a-alert message="葵花宝典模式会删除原始子目录" description="每个分享链接创建后，保存路径临时副本和对应原始子目录会立即移入 115 回收站，然后推送频道；推送失败时每隔 2–4 分钟重试直至成功。请确认这些原始文件可以删除；本模式不会清空回收站。" type="warning" show-icon />
       </div>
       <div v-if="formState.share_mode === 'per_file'" style="margin-top: 12px">
         <a-alert message="逐条分享模式会删除原文件和副本" description="每个文件创建分享链接后，副本和对应原文件会立即移入 115 回收站，然后推送频道。推送失败时系统会每隔 2–4 分钟重试，直至成功。本模式不会清空回收站。" type="warning" show-icon />

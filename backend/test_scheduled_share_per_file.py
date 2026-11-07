@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 from app.api.scheduled_share import ScheduledShareTaskCreate, ScheduledShareTaskUpdate
 from app.services import scheduler
-from app.services.scheduler import _sunflower_name_parts
 from app.services.tg_bot import TGService
 
 
@@ -21,14 +20,6 @@ def test_scheduled_share_api_accepts_per_file_mode():
 
     assert create_payload.share_mode == "per_file"
     assert update_payload.share_mode == "per_file"
-
-
-def test_per_file_mode_uses_tmdb_media_name_for_file_copy():
-    assert _sunflower_name_parts("十万个冷笑话 (2014) [tmdbid=323182]") == (
-        "shiwangelengxiaohua (2014) [tmdbid=323182]",
-        "323182",
-        "十万个冷笑话",
-    )
 
 
 def test_per_file_discovery_skips_desensitization_without_tmdb_id():
@@ -108,13 +99,22 @@ def test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery():
                 }]
             }
             self.copied_files = {}
-            self.rename_payloads = []
+            self.created_dirs = []
+            self.replacement_options = []
             self.deleted_ids = []
             self.events = []
+            self.next_dir_id = 89
 
         async def _get_dir_items(self, cid, *, strict=False):
             assert strict
             return list(self.copied_files.get(cid, self.source_files.get(cid, [])))
+
+        async def _ensure_save_dir(self):
+            return 77
+
+        @property
+        def save_dir(self):
+            return "/AccountSave"
 
         async def _fs_category_get_with_fallback(self, _cid, *, timeout=30):
             return {"state": True, "size": 100, "count": 1, "folder_count": 0}
@@ -122,19 +122,25 @@ def test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery():
         def _is_margin_response(self, _response):
             return False
 
+        async def replace_sensitive_words_in_dir(self, cid, **options):
+            assert cid == 90
+            self.replacement_options.append(options)
+            self.copied_files[91][0]["name"] = (
+                "English Alias.2014.2160p.HEVC.AAC.mkv"
+            )
+
         async def _api_call_with_timeout(self, func, *args, **kwargs):
             if func is self.client.fs_makedirs_app:
-                return {"state": True, "data": {"cid": 90}}
+                self.created_dirs.append((args[0], kwargs["pid"]))
+                self.next_dir_id += 1
+                return {"state": True, "data": {"cid": self.next_dir_id}}
             if func is self.client.fs_copy_app:
-                self.copied_files[90] = [{
+                assert kwargs["pid"] == 91
+                self.copied_files[91] = [{
                     "id": "201",
                     "name": "十万个冷笑话.2014.2160p.HEVC.AAC.mkv",
                     "is_dir": False,
                 }]
-                return {"state": True}
-            if func is self.client.fs_rename_app:
-                self.rename_payloads.append(args[0])
-                self.copied_files[90][0]["name"] = args[0][1]
                 return {"state": True}
             if func is self.client.fs_delete_app:
                 self.deleted_ids.extend(args[0])
@@ -209,10 +215,14 @@ def test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery():
             )
         )
 
-    sanitized_name = (
-        "shiwangelengxiaohua (2014) [tmdbid=323182].2014.2160p.HEVC.AAC.mkv"
-    )
-    assert svc.rename_payloads == [("201", sanitized_name)]
+    assert svc.created_dirs[0][1] == 77
+    assert svc.created_dirs[1][0] == "十万个冷笑话 (2014) [tmdbid=323182]"
+    assert svc.created_dirs[1][1] == 90
+    assert svc.replacement_options == [{
+        "replace_enabled": True,
+        "replace_pinyin": "2",
+        "replace_tmdb": True,
+    }]
     assert svc.deleted_ids == [90, "21", 11]
     assert len(tg.broadcasts) == 3
     assert tg.broadcasts[0][2]["validate_only"] is True
@@ -223,6 +233,7 @@ def test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery():
         "📄 定时逐条分享：十万个冷笑话.2014.2160p.HEVC.AAC.mkv\n"
         "🔗 链接：https://115.com/s/per-file-test"
     )
+    assert tg.broadcasts[1][1]["full_text"].count("https://115.com/s/per-file-test") == 1
     assert tg.broadcasts[1][1]["scheduled_share_per_file"] is True
     assert tg.broadcasts[1][2]["channel_ids"] == ["-1001"]
     assert tg.broadcasts[1][2]["raise_on_error"] is True
@@ -240,7 +251,6 @@ def test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery():
 
 def main():
     test_scheduled_share_api_accepts_per_file_mode()
-    test_per_file_mode_uses_tmdb_media_name_for_file_copy()
     test_per_file_discovery_skips_desensitization_without_tmdb_id()
     test_per_file_broadcast_includes_original_name_and_single_link_for_all_channels()
     test_per_file_mode_copies_sanitizes_shares_and_deletes_after_delivery()

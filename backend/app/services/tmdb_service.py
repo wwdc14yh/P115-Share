@@ -12,8 +12,8 @@ from app.models.schema import TMDBAliasCache, TMDBConfig, SensitiveMovie
 
 class TMDBService:
     """TMDB API 服务"""
-
     BASE_URL = "https://api.themoviedb.org/3"
+    # BASE_URL = "https://api.themoviedb.org/3"
     RATE_LIMIT_DELAY = 0.25   # 页间延迟 250ms
     MOVIE_DELAY = 0.5          # 每部电影处理后延迟 500ms，避免触发限速
 

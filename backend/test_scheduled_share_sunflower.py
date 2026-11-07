@@ -3,11 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.services import scheduler
-from app.services.scheduler import (
-    _extract_sunflower_tmdb_id,
-    _sunflower_file_name,
-    _sunflower_name_parts,
-)
+from app.services.scheduler import _extract_sunflower_tmdb_id
 
 
 def test_extract_sunflower_tmdb_id_from_supported_tags():
@@ -17,44 +13,7 @@ def test_extract_sunflower_tmdb_id_from_supported_tags():
     assert _extract_sunflower_tmdb_id("Title without an identifier") is None
 
 
-def test_sunflower_directory_name_uses_pinyin_year_and_canonical_tmdb_tag():
-    assert _sunflower_name_parts("雷霆令 (2026) [tmdbid=336706]") == (
-        "leitingling (2026) [tmdbid=336706]",
-        "336706",
-        "雷霆令",
-    )
-
-
-def test_directory_without_tmdb_id_is_not_desensitized():
-    assert _sunflower_name_parts("雷霆令 (2026)") == (
-        "雷霆令 (2026)",
-        None,
-        None,
-    )
-
-
-def test_sunflower_file_name_adds_directory_prefix_and_preserves_media_details():
-    assert _sunflower_file_name(
-        "雷霆令.2026.S01E03.2160p.HDR Vivid.WEB-DL.H265.AAC.mkv",
-        source_dir_name="雷霆令 (2026) [tmdbid=336706]",
-        source_title="雷霆令",
-        standardized_dir_name="leitingling (2026) [tmdbid=336706]",
-    ) == (
-        "leitingling (2026) [tmdbid=336706].2026.S01E03."
-        "2160p.HDR Vivid.WEB-DL.H265.AAC.mkv"
-    )
-
-
-def test_sunflower_file_name_transliterates_remaining_chinese_text():
-    assert _sunflower_file_name(
-        "雷霆令.特别篇.mkv",
-        source_dir_name="雷霆令 [tmdbid=336706]",
-        source_title="雷霆令",
-        standardized_dir_name="leitingling [tmdbid=336706]",
-    ) == "leitingling [tmdbid=336706].tebiepian.mkv"
-
-
-async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery():
+async def test_sunflower_mode_uses_save_path_and_sensitive_management():
     class FakeService:
         def __init__(self):
             self.client = SimpleNamespace(
@@ -66,6 +25,16 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
             self.rename_payloads = []
             self.deleted_ids = []
             self.events = []
+            self.created_dirs = []
+            self.replacement_options = []
+            self.next_dir_id = 89
+
+        @property
+        def save_dir(self):
+            return "/AccountSave"
+
+        async def _ensure_save_dir(self):
+            return 77
 
         async def _get_dir_items(self, cid, *, strict=False):
             assert strict
@@ -78,9 +47,11 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
             if cid == 12:
                 return []
             if cid == 90:
+                return [{"id": "91", "name": "雷霆令 (2026) [tmdbid=336706]", "is_dir": True}]
+            if cid == 91:
                 return [{
                     "id": "201",
-                    "name": "雷霆令.2026.S01E03.2160p.mkv",
+                    "name": "Thunder Command.2026.S01E03.2160p.mkv",
                     "is_dir": False,
                 }]
             raise AssertionError(f"Unexpected directory listing: {cid}")
@@ -91,10 +62,18 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
         def _is_margin_response(self, _response):
             return False
 
+        async def replace_sensitive_words_in_dir(self, cid, **options):
+            assert cid == 90
+            self.replacement_options.append(options)
+            self.events.append("sensitive_replace")
+
         async def _api_call_with_timeout(self, func, *args, **kwargs):
             if func is self.client.fs_makedirs_app:
-                return {"state": True, "data": {"cid": 90}}
+                self.created_dirs.append((args[0], kwargs["pid"]))
+                self.next_dir_id += 1
+                return {"state": True, "data": {"cid": self.next_dir_id}}
             if func is self.client.fs_copy_app:
+                assert kwargs["pid"] == 91
                 return {"state": True}
             if func is self.client.fs_rename_app:
                 self.rename_payloads.append(args[0])
@@ -109,7 +88,7 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
             return {}
 
         async def _share_fids_direct(self, fids):
-            assert fids == [90]
+            assert fids == [91]
             self.events.append("share")
             return "https://115.com/s/test"
 
@@ -138,8 +117,6 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
     ]
 
     async def no_pause(*_args, **_kwargs):
-        if _kwargs.get("minimum", 0) >= 180:
-            svc.events.append("post_broadcast_wait")
         return None
 
     async def copy_complete(*_args, **_kwargs):
@@ -158,26 +135,33 @@ async def test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery()
             svc, task, 5, 10, parent_items
         )
 
-    assert svc.deleted_ids == [90, 11]
-    assert svc.rename_payloads[0] == (90, "leitingling (2026) [tmdbid=336706]")
-    assert svc.rename_payloads[1] == [
-        ("201", "leitingling (2026) [tmdbid=336706].2026.S01E03.2160p.mkv")
+    assert svc.created_dirs == [
+        (svc.created_dirs[0][0], 77),
+        ("雷霆令 (2026) [tmdbid=336706]", 90),
     ]
+    assert svc.created_dirs[0][0].startswith(".scheduled_share_5_")
+    assert svc.deleted_ids == [90, 11]
+    assert svc.rename_payloads == []
+    assert svc.replacement_options == [{
+        "replace_enabled": True,
+        "replace_pinyin": "2",
+        "replace_tmdb": True,
+    }]
     assert len(tg.broadcasts) == 2
     assert tg.broadcasts[0][2]["validate_only"] is True
     assert tg.broadcasts[1][2]["channel_ids"] == ["-1001"]
     assert tg.broadcasts[1][2]["raise_on_error"] is True
-    assert svc.events == ["share", "broadcast", "post_broadcast_wait", "delete"]
+    assert tg.broadcasts[1][1]["full_text"] == (
+        "🌻 葵花宝典定时分享：雷霆令 (2026) [tmdbid=336706]\n"
+        "🔗 链接：https://115.com/s/test"
+    )
+    assert svc.events == ["sensitive_replace", "share", "delete", "broadcast"]
 
 
 def main():
     test_extract_sunflower_tmdb_id_from_supported_tags()
-    test_sunflower_directory_name_uses_pinyin_year_and_canonical_tmdb_tag()
-    test_directory_without_tmdb_id_is_not_desensitized()
-    test_sunflower_file_name_adds_directory_prefix_and_preserves_media_details()
-    test_sunflower_file_name_transliterates_remaining_chinese_text()
-    asyncio.run(test_sunflower_mode_skips_empty_dirs_and_deletes_only_after_delivery())
-    print("All sunflower naming tests passed")
+    asyncio.run(test_sunflower_mode_uses_save_path_and_sensitive_management())
+    print("All sunflower workflow tests passed")
 
 
 if __name__ == "__main__":
