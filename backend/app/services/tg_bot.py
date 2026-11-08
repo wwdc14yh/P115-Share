@@ -2,16 +2,35 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import BotCommand
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter
 from aiohttp_socks import ProxyConnector
+from html.parser import HTMLParser
 from app.core.config import settings
 from app.services.p115 import p115_service
 from app.services.mh_decrypt import resolve_display_share_url
 from loguru import logger
+import aiohttp
 import asyncio
 import re
 import time
 from datetime import datetime
+from urllib.parse import urljoin, urlsplit
+
+
+class _TelegraphPageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hrefs = []
+        self.text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.hrefs.append(href)
+
+    def handle_data(self, data):
+        self.text_parts.append(data)
 
 def _get_svc():
     """获取当前最优 P115Service（负载均衡调度），降级到全局单例"""
@@ -186,7 +205,7 @@ class TGService:
             return
         help_text = (
             "👋 欢迎使用 P115-Share 机器人！\n\n"
-            "直接发送 115 分享链接（支持 115.com, 115cdn.com, anxia.com），我将自动为你保存并创建长期分享。\n\n"
+            "直接发送 115 分享链接（支持 115.com, 115cdn.com, anxia.com, telegra.ph），我将自动为你保存并创建长期分享。\n\n"
             "💡 可用命令：\n"
             "/start - 显示欢迎信息\n"
             "/help - 查看详细使用说明\n"
@@ -209,6 +228,74 @@ class TGService:
             logger.warning(f"Unauthorized chat access attempt for /id: {message.chat.id}")
             return
         await message.answer(f"当前聊天 ID: `{message.chat.id}`", parse_mode="Markdown")
+
+    async def _fetch_telegraph_links(self, url: str) -> tuple[list[str], list[str]]:
+        """Fetch a Telegraph page and return its 115 and ed2k links."""
+
+        def is_telegraph_url(candidate: str) -> bool:
+            try:
+                parsed = urlsplit(candidate)
+                expected_port = 443 if parsed.scheme == "https" else 80
+                return (
+                    parsed.scheme in {"http", "https"}
+                    and parsed.hostname == "telegra.ph"
+                    and parsed.username is None
+                    and parsed.password is None
+                    and parsed.port in (None, expected_port)
+                )
+            except ValueError:
+                return False
+
+        if not is_telegraph_url(url):
+            raise ValueError("仅支持 telegra.ph 域名")
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            page_url = url
+            for redirect_count in range(4):
+                async with session.get(page_url, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        redirected_url = urljoin(page_url, location or "")
+                        if not location or not is_telegraph_url(redirected_url):
+                            raise ValueError("Telegraph 页面重定向到非 telegra.ph 域名")
+                        if redirect_count == 3:
+                            raise ValueError("Telegraph 页面重定向次数过多")
+                        page_url = redirected_url
+                        continue
+                    if response.status != 200:
+                        raise ValueError(f"Telegraph 页面返回 HTTP {response.status}")
+
+                    content = await response.content.read(2 * 1024 * 1024 + 1)
+                    if len(content) > 2 * 1024 * 1024:
+                        raise ValueError("Telegraph 页面超过 2 MB，已停止解析")
+                    html = content.decode(response.charset or "utf-8", errors="replace")
+                    break
+            else:
+                raise ValueError("Telegraph 页面重定向次数过多")
+
+        parser = _TelegraphPageParser()
+        parser.feed(html)
+        page_content = "\n".join(parser.text_parts + parser.hrefs)
+        share_pattern = (
+            r'https?://(?:115\.com|115cdn\.com|anxia\.com)/s/'
+            r'[a-zA-Z0-9]+(?:[\?#][^ \s\n\r"\'<>]+)?'
+        )
+        ed2k_pattern = r'ed2k://\|file\|[^\s"\'<>]+'
+
+        share_links = []
+        for match in re.finditer(share_pattern, page_content, flags=re.IGNORECASE):
+            link = match.group(0).rstrip(".,;:!?)]}")
+            if link not in share_links:
+                share_links.append(link)
+
+        ed2k_links = []
+        for match in re.finditer(ed2k_pattern, page_content, flags=re.IGNORECASE):
+            link = match.group(0).rstrip(".,;:!?)]}")
+            if link not in ed2k_links:
+                ed2k_links.append(link)
+
+        return share_links, ed2k_links
 
     async def handle_message(self, message: types.Message):
         # Whitelist check
@@ -235,13 +322,55 @@ class TGService:
                 end = entity.offset + entity.length
                 url = full_text[start:end]
                 entity_urls.append(url)
+        if message.reply_markup:
+            for row in message.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.url:
+                        entity_urls.append(button.url)
+
+        telegraph_pattern = r'https?://telegra\.ph/[^\s\n\r"\'<>]+'
+        telegraph_urls = []
+        for url in re.findall(telegraph_pattern, full_text, flags=re.IGNORECASE):
+            url = url.rstrip(".,;:!?)]}")
+            if url not in telegraph_urls:
+                telegraph_urls.append(url)
+        for url in entity_urls:
+            if re.match(r'^https?://telegra\.ph/', url, flags=re.IGNORECASE) and url not in telegraph_urls:
+                telegraph_urls.append(url)
+
+        telegraph_share_urls = []
+        ed2k_links = []
+        for telegraph_url in telegraph_urls:
+            try:
+                page_share_urls, page_ed2k_links = await self._fetch_telegraph_links(telegraph_url)
+                telegraph_share_urls.extend(page_share_urls)
+                ed2k_links.extend(page_ed2k_links)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                logger.warning(f"解析 Telegraph 页面失败 {telegraph_url}: {exc}")
+                await message.reply(f"⚠️ Telegraph 页面解析失败：{telegraph_url}\n原因：{exc}")
+
+        telegraph_share_urls = list(dict.fromkeys(telegraph_share_urls))
+        ed2k_links = list(dict.fromkeys(ed2k_links))
+        if ed2k_links:
+            failed_channels = await self.broadcast_text_to_channels("\n".join(ed2k_links))
+            if failed_channels is None:
+                await message.reply("⚠️ 未找到已启用的自动转发频道，ed2k 链接未推送。")
+            elif failed_channels:
+                await message.reply(
+                    "⚠️ ed2k 链接推送失败，频道："
+                    + ", ".join(failed_channels)
+                )
+
+        broadcast_text = full_text
+        if telegraph_share_urls:
+            broadcast_text += "\n\n" + "\n".join(telegraph_share_urls)
         
         # 115 Link Detection (Regex)
         link_pattern = r'https?://(?:115\.com|115cdn\.com|anxia\.com)/s/[a-zA-Z0-9]+(?:[\?#][^ \s\n\r"\'<>]+)?'
         
         # Extract links from text and entity URLs
-        text_links = re.findall(link_pattern, full_text)
-        all_potential_links = text_links + [url for url in entity_urls if re.match(link_pattern, url)]
+        text_links = re.findall(link_pattern, broadcast_text)
+        all_potential_links = text_links + telegraph_share_urls + [url for url in entity_urls if re.match(link_pattern, url)]
         
         # Deduplicate while preserving order
         share_urls = []
@@ -253,6 +382,8 @@ class TGService:
         
         if not share_urls:
             logger.debug(f"❌ 未检测到 115 链接 - 文本: '{full_text[:100]}...', 实体URLs: {entity_urls}")
+            if ed2k_links:
+                return
             if full_text.startswith("/share") or full_text.startswith("/save"):
                 cmd = "/save" if full_text.startswith("/save") else "/share"
                 tip = "仅转存到网盘" if cmd == "/save" else "转存并生成长期分享"
@@ -260,11 +391,11 @@ class TGService:
                     f"💡 用法：`{cmd}` + 115 分享链接\n"
                     f"作用：{tip}\n\n"
                     "也可直接发送链接（按默认模式处理）。\n"
-                    "支持域名: 115.com, 115cdn.com, anxia.com",
+                    "支持域名: 115.com, 115cdn.com, anxia.com, telegra.ph",
                     parse_mode="Markdown",
                 )
             elif not full_text.startswith("/"):
-                await message.answer("⚠️ 请发送有效的 115 分享链接。\n支持域名: 115.com, 115cdn.com, anxia.com")
+                await message.answer("⚠️ 请发送有效的 115 分享链接。\n支持域名: 115.com, 115cdn.com, anxia.com, telegra.ph")
             return
 
         # ── 60s 内重复提交去重 ──────────────────────────────────────────
@@ -525,15 +656,15 @@ class TGService:
                 self._processing_urls.pop(share_url, None)
 
         # Prepare segments for broadcasting
-        # We find the positions of all share URLs in the original text (UTF-16)
-        text_utf16_len = self._get_utf16_len(full_text)
+        # We find the positions of all share URLs in the original and expanded text (UTF-16)
+        text_utf16_len = self._get_utf16_len(broadcast_text)
         link_positions = [] # [(start_u16, end_u16, url)]
         
         # Search for each URL's position to define segment boundaries
         for url in share_urls:
-            start_char = full_text.find(url)
+            start_char = broadcast_text.find(url)
             if start_char != -1:
-                start_u16 = self._get_utf16_len(full_text[:start_char])
+                start_u16 = self._get_utf16_len(broadcast_text[:start_char])
                 end_char = start_char + len(url)
                 end_u16 = start_u16 + self._get_utf16_len(url)
                 link_positions.append((start_u16, end_u16, url))
@@ -558,16 +689,16 @@ class TGService:
             if idx < len(link_positions) - 1:
                 next_start_u16 = link_positions[idx + 1][0]
                 # Get text between current link end and next link start
-                between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
-                between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
-                between_text = full_text[between_start_char:between_end_char]
+                between_start_char = len(broadcast_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
+                between_end_char = len(broadcast_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
+                between_text = broadcast_text[between_start_char:between_end_char]
                 
                 # Look for double newline as a natural separator
                 double_newline_pos = between_text.find('\n\n')
                 if double_newline_pos != -1:
                     # Found a paragraph break, split there
                     split_char = between_start_char + double_newline_pos + 2  # +2 to include the \n\n
-                    seg_end = self._get_utf16_len(full_text[:split_char])
+                    seg_end = self._get_utf16_len(broadcast_text[:split_char])
                 else:
                     # No clear separator; use a heuristic
                     # If there's significant content after the link, include some of it
@@ -579,7 +710,7 @@ class TGService:
                 # Last link: extend to end of text
                 seg_end = text_utf16_len
             
-            slice_text, slice_entities = self._slice_message(full_text, ser_entities, last_boundary, seg_end)
+            slice_text, slice_entities = self._slice_message(broadcast_text, ser_entities, last_boundary, seg_end)
             segments.append({
                 "text": slice_text,
                 "entities": slice_entities,
@@ -625,7 +756,7 @@ class TGService:
                         await self.broadcast_to_channels(
                             {url: share_link},
                             {
-                                "full_text": full_text,
+                                "full_text": broadcast_text,
                                 "entities": ser_entities,
                                 "photo_id": photo.file_id if photo else None
                             }
@@ -1470,6 +1601,63 @@ class TGService:
             logger.error(f"Failed to get chat info for {chat_id}: {e}")
             return None
 
+    def _get_enabled_broadcast_channels(self, channel_ids: list = None) -> list[dict]:
+        import json
+
+        try:
+            channels = json.loads(settings.TG_CHANNELS)
+        except (json.JSONDecodeError, TypeError):
+            channels = []
+
+        legacy_id = settings.TG_CHANNEL_ID
+        if legacy_id and not any(c.get("id") == str(legacy_id) for c in channels):
+            channels.append({"id": str(legacy_id), "enabled": True, "concise": False})
+
+        enabled_channels = [channel for channel in channels if channel.get("enabled")]
+        if channel_ids is not None:
+            target_ids = {str(channel_id) for channel_id in channel_ids}
+            return [
+                channel
+                for channel in enabled_channels
+                if str(channel.get("id")) in target_ids
+            ]
+
+        # 普通消息推送：仅发送至开启了“自动转发”的频道。
+        return [
+            channel
+            for channel in enabled_channels
+            if channel.get("auto_forward", True)
+        ]
+
+    async def broadcast_text_to_channels(
+        self, text: str, channel_ids: list = None
+    ) -> list[str] | None:
+        """Send raw text to enabled auto-forward channels; return failed IDs or None if none exist."""
+        channels = self._get_enabled_broadcast_channels(channel_ids)
+        if not channels:
+            logger.warning(f"没有符合条件的目标频道 (channel_ids={channel_ids})，跳过文本广播")
+            return None
+        if not self.bot:
+            raise RuntimeError("Telegram Bot 尚未初始化，无法推送消息")
+
+        failed_channels = []
+        for channel in channels:
+            channel_id = channel.get("id")
+            if not channel_id:
+                logger.error(f"目标频道缺少 ID，无法推送消息: {channel}")
+                failed_channels.append("unknown")
+                continue
+            try:
+                await self.bot.send_message(
+                    channel_id,
+                    text=text,
+                    disable_web_page_preview=False,
+                )
+            except (TelegramAPIError, asyncio.TimeoutError) as exc:
+                logger.error(f"向频道 {channel_id} 推送文本失败: {exc}")
+                failed_channels.append(str(channel_id))
+        return failed_channels
+
     async def broadcast_to_channels(
         self,
         share_links_map: dict,
@@ -1482,27 +1670,7 @@ class TGService:
         """Broadcast processed link(s) to all configured and enabled channels
         :param channel_ids: Optional list of channel IDs to filter the broadcast. If None, send to all enabled.
         """
-        import json
-        channels = []
-        try:
-            channels = json.loads(settings.TG_CHANNELS)
-        except Exception:
-            pass
-            
-        legacy_id = settings.TG_CHANNEL_ID
-        if legacy_id and not any(c.get("id") == str(legacy_id) for c in channels):
-            channels.append({"id": str(legacy_id), "enabled": True, "concise": False})
-            
-        enabled_channels = [c for c in channels if c.get("enabled")]
-        
-        # Filter by specific channel_ids if requested (e.g. for batch tasks)
-        if channel_ids is not None:
-            target_ids = set(str(cid) for cid in channel_ids)
-            enabled_channels = [c for c in enabled_channels if str(c.get("id")) in target_ids]
-        else:
-            # 普通消息推送：仅发送至开启了“自动转发”的频道
-            # 注意：默认为 True 以保证向后兼容性 (已有频道默认开启)
-            enabled_channels = [c for c in enabled_channels if c.get("auto_forward", True)]
+        enabled_channels = self._get_enabled_broadcast_channels(channel_ids)
         
         if not enabled_channels:
             logger.debug(f"没有符合条件的目标频道 (channel_ids={channel_ids})，跳过广播")
