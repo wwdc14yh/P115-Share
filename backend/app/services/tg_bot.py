@@ -3,7 +3,13 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter
-from aiohttp_socks import ProxyConnector
+from aiohttp_socks import (
+    ProxyConnectionError,
+    ProxyConnector,
+    ProxyError,
+    ProxyTimeoutError,
+    SocksError,
+)
 from html.parser import HTMLParser
 from app.core.config import settings
 from app.services.p115 import p115_service
@@ -250,10 +256,33 @@ class TGService:
             raise ValueError("仅支持 telegra.ph 域名")
 
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        proxy_url = None
+        connector = None
+        if settings.PROXY_ENABLED and settings.PROXY_HOST and settings.PROXY_PORT:
+            proxy_type = settings.PROXY_TYPE.lower()
+            auth = (
+                f"{settings.PROXY_USER}:{settings.PROXY_PASS}@"
+                if settings.PROXY_USER and settings.PROXY_PASS
+                else ""
+            )
+            proxy_url = (
+                f"{proxy_type}://{auth}{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+            )
+            if proxy_type == "socks5":
+                connector = ProxyConnector.from_url(proxy_url)
+            elif proxy_type != "http":
+                raise ValueError(f"不支持的代理类型: {settings.PROXY_TYPE}")
+
+        async with aiohttp.ClientSession(
+            timeout=timeout, connector=connector
+        ) as session:
             page_url = url
             for redirect_count in range(4):
-                async with session.get(page_url, allow_redirects=False) as response:
+                async with session.get(
+                    page_url,
+                    allow_redirects=False,
+                    proxy=proxy_url if connector is None else None,
+                ) as response:
                     if response.status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         redirected_url = urljoin(page_url, location or "")
@@ -345,7 +374,15 @@ class TGService:
                 page_share_urls, page_ed2k_links = await self._fetch_telegraph_links(telegraph_url)
                 telegraph_share_urls.extend(page_share_urls)
                 ed2k_links.extend(page_ed2k_links)
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                ValueError,
+                ProxyConnectionError,
+                ProxyError,
+                ProxyTimeoutError,
+                SocksError,
+            ) as exc:
                 logger.warning(f"解析 Telegraph 页面失败 {telegraph_url}: {exc}")
                 await message.reply(f"⚠️ Telegraph 页面解析失败：{telegraph_url}\n原因：{exc}")
 
